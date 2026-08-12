@@ -101,7 +101,9 @@ def main():
 
     print(f"\n[ Step 2 ] Scoring {len(raw_hits)} hits against 5 pillars …\n")
 
+    # api is now a tuple: (data_client, trading_client)
     api = _get_alpaca_client()
+
     candidates = []
     all_results = []
 
