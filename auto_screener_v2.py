@@ -3,39 +3,42 @@ import csv
 import os
 
 print(f"\n{'='*60}")
-print(" Auto-Generating Watchlist - Gap Up Stocks")
+print(" Auto-Generating Watchlist - Gap Up Stocks (v2)")
 print(f"{'='*60}\n")
 
-# Finviz filters for gap-up stocks
+# Simpler filters - more reliable
 filters = [
-    'cap_nano',      # Nano cap ($50M-$300M) - more volatile
+    'exch_nyse',     # NYSE stocks only (more reliable)
     'price_o5',      # Price over $5
     'vol_o500',      # Volume over 500K
-    'gap_u15',       # Gap up 15%+
-    'relvol_o2',     # Relative volume over 2x
+    'gap_u10',       # Gap up 10%+ (lower threshold)
 ]
 
 print(f"Filters:")
-print(f"  - Nano cap stocks ($50M-$300M)")
+print(f"  - NYSE stocks")
 print(f"  - Price over $5")
 print(f"  - Volume over 500K")
-print(f"  - Gap up 15%+")
-print(f"  - Relative volume over 2x")
+print(f"  - Gap up 10%+")
 print(f"\nScanning...\n")
 
 try:
     # Get screener results
     stocks = Screener(filters=filters, table="Performance", order="-gap")
     
-    # Extract tickers
-    tickers = [stock['Ticker'] for stock in stocks]
+    # Show first stock to debug
+    if stocks:
+        print(f"Sample stock data: {stocks[0]}")
+        print()
     
-    print(f"Found {len(tickers)} gap-up stocks:\n")
-    for i, ticker in enumerate(tickers[:20], 1):
+    # Extract tickers - filter out single chars
+    tickers = [stock['Ticker'] for stock in stocks if len(stock['Ticker']) >= 2]
+    
+    print(f"Found {len(tickers)} valid gap-up stocks:\n")
+    for i, ticker in enumerate(tickers[:30], 1):
         print(f"  {i:2}. {ticker}")
     
-    if len(tickers) > 20:
-        print(f"  ... and {len(tickers) - 20} more")
+    if len(tickers) > 30:
+        print(f"  ... and {len(tickers) - 30} more")
     
     # Save to watchlist
     watchlist_path = 'data/watchlist.csv'
@@ -43,15 +46,15 @@ try:
     
     with open(watchlist_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['TICKER'])  # Header
+        writer.writerow(['TICKER'])
         for ticker in tickers:
             writer.writerow([ticker])
     
     print(f"\n✓ Saved {len(tickers)} tickers to {watchlist_path}")
-    print(f"\nYour scanner will now auto-monitor these stocks!")
     
 except Exception as e:
     print(f"Error: {e}")
-    print("\nFinviz may be rate-limiting. Try again in a few minutes.")
+    import traceback
+    traceback.print_exc()
 
 print(f"\n{'='*60}\n")

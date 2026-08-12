@@ -1,4 +1,3 @@
-
 """
 main_scan.py
 
@@ -13,6 +12,9 @@ Flow:
 4. Saves candidates to logs/ for session_monitor to pick up
 5. Overwrites data/watchlist.csv so manual Finviz step is obsolete
 """
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import os
 import csv
@@ -32,7 +34,6 @@ def save_scan_log(candidates: list[dict], all_results: list[dict]):
     os.makedirs(LOG_DIR, exist_ok=True)
     date_str = datetime.now(ET).strftime("%Y%m%d")
 
-    # CSV of all scored tickers
     path = os.path.join(LOG_DIR, f"scan_{date_str}.csv")
     fields = ["ticker", "score", "price", "gap_pct", "rel_vol",
               "total_vol", "float", "gap", "price_pillar",
@@ -57,7 +58,6 @@ def save_scan_log(candidates: list[dict], all_results: list[dict]):
             }
             w.writerow(row)
 
-    # JSON of passing candidates for session_monitor
     candidates_clean = [{k: v for k, v in c.items() if k != "bars"}
                         for c in candidates]
     json_path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
@@ -69,10 +69,6 @@ def save_scan_log(candidates: list[dict], all_results: list[dict]):
 
 
 def write_watchlist_csv(candidates: list[dict]):
-    """
-    Overwrite data/watchlist.csv with today's auto-screened tickers.
-    This makes the manual Finviz → CSV step completely obsolete.
-    """
     os.makedirs("data", exist_ok=True)
     csv_path = "data/watchlist.csv"
     with open(csv_path, "w", newline="") as f:
@@ -89,14 +85,13 @@ def main():
     print(f" {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')}")
     print(f"{'='*55}\n")
 
-    # Step 1: auto-screen the whole market
     print("[ Step 1 ] Screening full market for gap/momentum …\n")
     raw_hits = screen_market(
         min_price=2.0,
         max_price=20.0,
         min_gap_pct=0.10,
         min_volume=100_000,
-        max_results=25,  # score the top 25 gap stocks
+        max_results=25,
     )
 
     if not raw_hits:
@@ -120,7 +115,7 @@ def main():
             candidates.append(result)
             print(f"✓ {result['score']}/5 "
                   f"gap={result['gap_pct']}% "
-                  f"rvol={result['rel_vol']}×· "
+                  f"rvol={result['rel_vol']}× "
                   f"vol={result['total_vol']:,}")
         else:
             all_results.append({"ticker": ticker, "score": 0,
@@ -132,7 +127,7 @@ def main():
 
     print(f"\n {len(candidates)} candidate(s) passing ≥4 pillars.")
     save_scan_log(candidates, all_results)
-    write_watchlist_csv(candidates)  # <-- new: auto-update watchlist
+    write_watchlist_csv(candidates)
 
     if candidates:
         send_scan_summary(candidates)

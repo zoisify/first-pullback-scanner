@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 
 
-def _get_alpaca_client():
+def get_alpaca_client():
     """Returns an Alpaca REST client using env vars set by GitHub Actions secrets."""
     import alpaca_trade_api as tradeapi
 
@@ -169,3 +169,6 @@ def _get_float_yfinance(ticker: str) -> int | None:
         return getattr(info, "shares", None)
     except Exception:
         return None
+
+# legacy alias
+_get_alpaca_client = get_alpaca_client
