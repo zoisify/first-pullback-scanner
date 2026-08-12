@@ -1,218 +1,254 @@
 """
-scanner/signals.py
-
-Detects the "first pullback" entry signal on a 1-minute bar DataFrame.
-Returns structured signal dicts that notify.py formats for Discord.
-
-Entry rules (from transcript + systematization):
-  1. Stock has made a squeeze: moved >= 5% off a recent swing low
-  2. Pullback: retraces <= 50% of the up-leg
-  3. Pullback stays above 9 EMA AND above VWAP
-  4. Volume dries up on red pullback candles
-  5. "Crossing candle": first candle whose HIGH exceeds the prior candle's HIGH
-     → enter on that break; stop = pullback low
-
-Exit signals (Ross's exit indicators, systematized):
-  - Stop hit (coded as a level returned, not executed — paper order handles this)
-  - Volume spike on red candle (proxy for "big seller on Level 2")
-  - Topping tail candle (large upper wick, closes red)
-  - Price closes below 9 EMA
-  - Price closes below VWAP
-  - Hard 10:00 AM ET cutoff
+Signal detection and order execution for first-pullback strategy
+Ross-style: Scale-out at 1.5R/3R/5R, hold 25% core with trailing stop
 """
 
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass, field
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import yfinance as yf
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from enum import Enum
 
-ET = ZoneInfo("America/New_York")
-
-
-# ── Indicator helpers ──────────────────────────────────────────────────────────
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def vwap(bars: pd.DataFrame) -> pd.Series:
-    """Session VWAP — resets daily (bars should be today's bars only)."""
-    typical = (bars["High"] + bars["Low"] + bars["Close"]) / 3
-    return (typical * bars["Volume"]).cumsum() / bars["Volume"].cumsum()
-
-
-# ── Signal dataclass ───────────────────────────────────────────────────────────
+class SignalType(Enum):
+    ENTRY = "ENTRY"
+    EXIT = "EXIT"
+    SCALE_OUT = "SCALE_OUT"
+    TRAIL_STOP = "TRAIL_STOP"
 
 @dataclass
 class Signal:
-    type: str           # "ENTRY" | "EXIT"
+    type: SignalType
     ticker: str
     price: float
-    stop: float = 0.0
-    target_2r: float = 0.0
-    risk_per_share: float = 0.0
-    reason: str = ""
-    pillars: dict = field(default_factory=dict)
-    score: int = 0
-    timestamp: datetime = field(default_factory=lambda: datetime.now(ET))
-    gap_pct: float = 0.0
-    rel_vol: float = 0.0
-    total_vol: int = 0
+    reason: str
+    timestamp: datetime = None
+    
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
 
-
-# ── Core signal detector ───────────────────────────────────────────────────────
-
-def detect_entry(candidate: dict, squeeze_threshold: float = 0.05,
-                 max_retrace: float = 0.50) -> Signal | None:
-    """
-    Run the first-pullback entry logic on a candidate's bar data.
-    Returns a Signal if an entry triggers, else None.
-    """
-    bars = candidate["bars"].copy()
-    if len(bars) < 6:
+def detect_first_pullback(ticker: str, lookback_days: int = 5) -> Optional[Signal]:
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=f"{lookback_days}d", interval="1d")
+        
+        if len(hist) < 3:
+            return None
+        
+        day0 = hist.iloc[-3]
+        day1 = hist.iloc[-2]
+        day2 = hist.iloc[-1]
+        
+        prev_close = hist.iloc[-4]['Close'] if len(hist) > 3 else day0['Open']
+        gap_up_pct = (day0['Open'] - prev_close) / prev_close
+        
+        if gap_up_pct < 0.10:
+            return None
+        
+        pullback_low = min(day1['Low'], day2['Low'])
+        pullback_high = max(day1['High'], day2['High'])
+        
+        if pullback_low > day0['Close'] * 0.97:
+            avg_volume = (day1['Volume'] + day2['Volume']) / 2
+            if avg_volume < day0['Volume'] * 0.7:
+                current_price = day2['Close']
+                return Signal(
+                    type=SignalType.ENTRY,
+                    ticker=ticker,
+                    price=current_price,
+                    reason=f"First pullback after {gap_up_pct*100:.1f}% gap-up, volume drying up"
+                )
+        
+        return None
+    except Exception as e:
+        print(f"Error detecting signal for {ticker}: {e}")
         return None
 
-    bars["EMA9"]  = ema(bars["Close"], 9)
-    bars["VWAP"]  = vwap(bars)
-
-    ticker = candidate["ticker"]
-    price  = bars["Close"].iloc[-1]
-
-    # Don't enter after 10:00 AM ET hard cutoff (Ross's own hardest rule)
-    now_et = datetime.now(ET)
-    if now_et.hour >= 10:
+def submit_entry_order(signal: Signal, qty: int = 33) -> Optional[Dict]:
+    from scanner.executor import get_trading_client
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    
+    try:
+        client = get_trading_client()
+        
+        order_data = MarketOrderRequest(
+            symbol=signal.ticker,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
+        )
+        
+        order = client.submit_order(order_data)
+        print(f"Entry order submitted: {signal.ticker} x {qty} @ {signal.price}")
+        
+        return {
+            "order_id": order.id,
+            "ticker": signal.ticker,
+            "qty": qty,
+            "entry_price": signal.price,
+            "timestamp": signal.timestamp
+        }
+    except Exception as e:
+        print(f"Failed to submit entry order: {e}")
         return None
 
-    # ── Find swing low and the up-leg ────────────────────────────────────────
-    window = bars.tail(30)   # look back max 30 bars for the setup
-    leg_low_idx  = window["Low"].idxmin()
-    leg_low      = window["Low"][leg_low_idx]
-    post_low     = window.loc[leg_low_idx:]
+def submit_scale_out_orders(entry_price: float, current_price: float, current_qty: int, ticker: str) -> List[Dict]:
+    from scanner.executor import get_trading_client
+    from alpaca.trading.requests import LimitOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    
+    client = get_trading_client()
+    orders = []
+    
+    risk_per_share = entry_price * 0.03
+    r_multiple = (current_price - entry_price) / risk_per_share
+    
+    scale_out_levels = [
+        {"r": 1.5, "pct": 0.25, "label": "1.5R (25%)"},
+        {"r": 3.0, "pct": 0.25, "label": "3R (25%)"},
+        {"r": 5.0, "pct": 0.25, "label": "5R (25%)"},
+    ]
+    
+    for level in scale_out_levels:
+        target_price = entry_price + (risk_per_share * level["r"])
+        
+        if current_price >= target_price:
+            qty_to_sell = int(current_qty * level["pct"])
+            
+            if qty_to_sell > 0:
+                try:
+                    order_data = LimitOrderRequest(
+                        symbol=ticker,
+                        qty=qty_to_sell,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        limit_price=round(target_price, 2)
+                    )
+                    
+                    order = client.submit_order(order_data)
+                    orders.append({
+                        "order_id": order.id,
+                        "type": "SCALE_OUT",
+                        "level": level["label"],
+                        "qty": qty_to_sell,
+                        "price": round(target_price, 2)
+                    })
+                    print(f"Scale-out order: {ticker} x {qty_to_sell} @ {target_price:.2f} ({level['label']})")
+                except Exception as e:
+                    print(f"Failed to submit scale-out order: {e}")
+    
+    return orders
 
-    if len(post_low) < 4:
+def submit_trailing_stop(ticker: str, qty: int, entry_price: float, current_price: float) -> Optional[Dict]:
+    from scanner.executor import get_trading_client
+    from alpaca.trading.requests import StopOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    
+    try:
+        client = get_trading_client()
+        
+        trail_pct = 0.10
+        stop_price = current_price * (1 - trail_pct)
+        
+        if stop_price < entry_price:
+            stop_price = entry_price * 0.99
+        
+        order_data = StopOrderRequest(
+            symbol=ticker,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2)
+        )
+        
+        order = client.submit_order(order_data)
+        print(f"Trailing stop: {ticker} x {qty} @ {stop_price:.2f}")
+        
+        return {
+            "order_id": order.id,
+            "type": "TRAILING_STOP",
+            "qty": qty,
+            "stop_price": round(stop_price, 2)
+        }
+    except Exception as e:
+        print(f"Failed to submit trailing stop: {e}")
         return None
 
-    leg_high     = post_low["High"].max()
-    move_pct     = (leg_high - leg_low) / leg_low if leg_low > 0 else 0
-
-    # Must have squeezed at least squeeze_threshold off the low
-    if move_pct < squeeze_threshold:
+def submit_exit_order(signal: Signal, current_qty: int) -> Optional[Dict]:
+    from scanner.executor import get_trading_client
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    
+    try:
+        client = get_trading_client()
+        
+        order_data = MarketOrderRequest(
+            symbol=signal.ticker,
+            qty=current_qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY
+        )
+        
+        order = client.submit_order(order_data)
+        print(f"Exit order: {signal.ticker} x {current_qty} @ {signal.price}")
+        
+        return {
+            "order_id": order.id,
+            "ticker": signal.ticker,
+            "qty": current_qty,
+            "exit_price": signal.price,
+            "reason": signal.reason
+        }
+    except Exception as e:
+        print(f"Failed to submit exit order: {e}")
         return None
 
-    # ── Find the pullback ────────────────────────────────────────────────────
-    leg_high_idx = post_low["High"].idxmax()
-    pullback     = window.loc[leg_high_idx:]
-
-    if len(pullback) < 2:
-        return None
-
-    pb_low       = pullback["Low"].min()
-    pb_retrace   = (leg_high - pb_low) / (leg_high - leg_low) if (leg_high - leg_low) > 0 else 1
-
-    # Pullback must not retrace more than 50%
-    if pb_retrace > max_retrace:
-        return None
-
-    # Pullback must stay above 9 EMA and VWAP
-    pb_below_ema  = (pullback["Close"] < pullback["EMA9"]).any()
-    pb_below_vwap = (pullback["Close"] < pullback["VWAP"]).any()
-    if pb_below_ema or pb_below_vwap:
-        return None
-
-    # Volume should dry up during pullback (red candles lighter than preceding green candles)
-    recent_green = window[window["Close"] > window["Open"]]["Volume"].tail(5)
-    pb_red       = pullback[pullback["Close"] < pullback["Open"]]["Volume"]
-    if not recent_green.empty and not pb_red.empty:
-        avg_green_vol = recent_green.mean()
-        avg_red_vol   = pb_red.mean()
-        if avg_red_vol > avg_green_vol:
-            return None   # volume not drying up — weaker setup
-
-    # ── "Crossing candle" — entry trigger ────────────────────────────────────
-    last_bar      = bars.iloc[-1]
-    prev_bar      = bars.iloc[-2]
-    crosses_high  = last_bar["High"] > prev_bar["High"]
-    last_is_green = last_bar["Close"] > last_bar["Open"]
-
-    if not (crosses_high and last_is_green):
-        return None
-
-    # ── Build the signal ─────────────────────────────────────────────────────
-    entry_price   = last_bar["High"]        # stop-buy above prior high
-    stop_price    = round(pb_low * 0.995, 2) # slight buffer below pullback low
-    risk          = entry_price - stop_price
-    if risk <= 0:
-        return None
-
-    target_2r     = round(entry_price + 2 * risk, 2)
-
-    return Signal(
-        type           = "ENTRY",
-        ticker         = ticker,
-        price          = round(entry_price, 2),
-        stop           = stop_price,
-        target_2r      = target_2r,
-        risk_per_share = round(risk, 2),
-        reason         = "first_pullback_crossing_candle",
-        pillars        = candidate["pillars"],
-        score          = candidate["score"],
-        gap_pct        = candidate["gap_pct"],
-        rel_vol        = candidate["rel_vol"],
-        total_vol      = candidate["total_vol"],
-    )
-
-
-def detect_exit(bars: pd.DataFrame, entry_price: float,
-                stop_price: float, ticker: str) -> Signal | None:
-    """
-    Checks exit conditions on updated bars.
-    Returns an EXIT Signal if any condition is met, else None.
-    Ross's exit indicators in priority order:
-      1. Stop hit
-      2. Volume-spike red candle (big seller proxy)
-      3. Topping tail
-      4. Below 9 EMA
-      5. Below VWAP
-    """
-    if len(bars) < 3:
-        return None
-
-    bars = bars.copy()
-    bars["EMA9"] = ema(bars["Close"], 9)
-    bars["VWAP"] = vwap(bars)
-
-    last    = bars.iloc[-1]
-    price   = last["Close"]
-    is_red  = price < last["Open"]
-
-    # 1. Stop hit
-    if last["Low"] <= stop_price:
-        return Signal(type="EXIT", ticker=ticker, price=stop_price,
-                      reason="stop_loss")
-
-    # 2. Volume spike on red candle (big seller proxy — Level 2 substitute)
-    recent_green = bars[bars["Close"] > bars["Open"]]["Volume"].tail(5)
-    avg_green_vol = recent_green.mean() if not recent_green.empty else last["Volume"]
-    if is_red and last["Volume"] > 1.5 * avg_green_vol:
-        return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
-                      reason="vol_spike_seller")
-
-    # 3. Topping tail (upper wick >= 50% of total range, closes red)
-    rng        = last["High"] - last["Low"]
-    upper_wick = last["High"] - max(price, last["Open"])
-    if rng > 0 and (upper_wick / rng) >= 0.50 and is_red:
-        return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
-                      reason="topping_tail")
-
-    # 4. Below 9 EMA
-    if price < last["EMA9"]:
-        return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
-                      reason="below_ema9")
-
-    # 5. Below VWAP
-    if price < last["VWAP"]:
-        return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
-                      reason="below_vwap")
-
-    return None
+def manage_position(ticker: str, entry_price: float, entry_time: datetime) -> Dict:
+    from scanner.executor import get_trading_client
+    
+    result = {
+        "ticker": ticker,
+        "action": "HOLD",
+        "orders": []
+    }
+    
+    try:
+        client = get_trading_client()
+        pos = client.get_open_position(ticker)
+        
+        if not pos:
+            return result
+        
+        current_price = float(pos.current_price)
+        current_qty = int(pos.qty)
+        
+        risk_per_share = entry_price * 0.03
+        r_multiple = (current_price - entry_price) / risk_per_share
+        
+        if datetime.now() - entry_time > timedelta(days=3):
+            exit_signal = Signal(
+                type=SignalType.EXIT,
+                ticker=ticker,
+                price=current_price,
+                reason="Time exit: 3 days held"
+            )
+            exit_result = submit_exit_order(exit_signal, current_qty)
+            if exit_result:
+                result["action"] = "EXIT"
+                result["orders"].append(exit_result)
+            return result
+        
+        if r_multiple >= 1.5:
+            scale_orders = submit_scale_out_orders(entry_price, current_price, current_qty, ticker)
+            if scale_orders:
+                result["action"] = "SCALE_OUT"
+                result["orders"].extend(scale_orders)
+        
+        if r_multiple >= 1.0 and current_qty > 0:
+            print(f"  Should trail stop for {ticker} core position")
+        
+        return result
+    except Exception as e:
+        print(f"Error managing position for {ticker}: {e}")
+        return result
