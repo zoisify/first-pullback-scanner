@@ -5,11 +5,11 @@ The 5-pillar universe filter from the transcript, scored per ticker.
 Uses Alpaca free tier for real-time bars and quote data.
 
 Ross's pillars (from transcript):
-  1. Relative volume >= 5x (he mentions 5-10x sweet spot, >20x exceptional)
-  2. Gap / move >= 10% from prior close
-  3. Price between $2 and $20
-  4. Float <= 20 million shares
-  5. Total volume >= 1M (soft — he says "not much volume" at 45K shares early on YXT)
+1. Relative volume >= 5x (he mentions 5-10x sweet spot, >20x exceptional)
+2. Gap / move >= 10% from prior close
+3. Price between $2 and $20
+4. Float <= 20 million shares
+5. Total volume >= 1M (soft — he says "not much volume" at 45K shares early on YXT)
 """
 
 import os
@@ -21,13 +21,12 @@ ET = ZoneInfo("America/New_York")
 
 
 def _get_alpaca_client():
-    """Returns an Alpaca REST client using env vars set by GitHub Actions secrets."""
-    import alpaca_trade_api as tradeapi
-    return tradeapi.REST(
-        key_id=os.environ["ALPACA_API_KEY"],
-        secret_key=os.environ["ALPACA_SECRET_KEY"],
-        base_url="https://paper-api.alpaca.markets",
-        api_version="v2",
+    """Returns an Alpaca TradingClient using env vars set by GitHub Actions secrets."""
+    from alpaca.trading.client import TradingClient
+    return TradingClient(
+        api_key=os.environ["APCA_API_KEY_ID"],
+        secret_key=os.environ["APCA_API_SECRET_KEY"],
+        paper=True,
     )
 
 
@@ -42,7 +41,7 @@ def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
             ticker,
             "1Min",
             limit=limit,
-            feed="iex",       # free tier — IEX feed
+            feed="iex",  # free tier — IEX feed
             adjustment="raw",
         ).df
         if bars.empty:
@@ -53,7 +52,7 @@ def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
         today = datetime.now(ET).date()
         return bars[bars.index.date == today]
     except Exception as e:
-        print(f"  [{ticker}] bars error: {e}")
+        print(f" [{ticker}] bars error: {e}")
         return pd.DataFrame()
 
 
@@ -85,8 +84,8 @@ def score_ticker(
         return None
 
     last_price = bars["Close"].iloc[-1]
-    open_price  = bars["Open"].iloc[0]
-    total_vol   = bars["Volume"].sum()
+    open_price = bars["Open"].iloc[0]
+    total_vol = bars["Volume"].sum()
     elapsed_min = len(bars)
 
     # Prior close: get yesterday's last bar
@@ -118,11 +117,11 @@ def score_ticker(
 
     # --- Score each pillar ---
     pillar_results = {
-        "gap":     gap_pct >= min_gap_pct,
-        "price":   min_price <= last_price <= max_price,
+        "gap": gap_pct >= min_gap_pct,
+        "price": min_price <= last_price <= max_price,
         "rel_vol": rel_vol >= min_rel_vol,
-        "volume":  total_vol >= min_total_vol,
-        "float":   (float_shares <= max_float) if float_shares else None,  # None = unknown
+        "volume": total_vol >= min_total_vol,
+        "float": (float_shares <= max_float) if float_shares else None,  # None = unknown
     }
 
     # Count definitive passes (None = unknown, doesn't count either way)
@@ -137,17 +136,17 @@ def score_ticker(
         return None
 
     return {
-        "ticker":       ticker,
-        "price":        round(last_price, 2),
-        "gap_pct":      round(gap_pct * 100, 1),
-        "rel_vol":      round(rel_vol, 1),
-        "total_vol":    int(total_vol),
-        "float":        int(float_shares) if float_shares else "unknown",
-        "score":        score,
-        "pillars":      {k: ("✓" if v else ("?" if v is None else "✗"))
-                         for k, v in pillar_results.items()},
-        "bars":         bars,   # pass through for signal detection
-        "prior_close":  prior_close,
+        "ticker": ticker,
+        "price": round(last_price, 2),
+        "gap_pct": round(gap_pct * 100, 1),
+        "rel_vol": round(rel_vol, 1),
+        "total_vol": int(total_vol),
+        "float": int(float_shares) if float_shares else "unknown",
+        "score": score,
+        "pillars": {k: ("✓" if v else ("?" if v is None else "✗"))
+                    for k, v in pillar_results.items()},
+        "bars": bars,  # pass through for signal detection
+        "prior_close": prior_close,
     }
 
 
