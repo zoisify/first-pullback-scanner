@@ -2,7 +2,7 @@
 scanner/executor.py
 
 Order execution layer for Alpaca paper trading.
-Uses the modern alpaca-py SDK with typed request objects.
+Uses the modern alpaca-py SDK (v0.26.0) with typed request objects.
 
 Usage in main_session.py:
     from scanner.executor import submit_entry_order, submit_exit_order
@@ -17,7 +17,7 @@ Usage in main_session.py:
 import os
 from typing import Optional
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, BracketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 
@@ -39,7 +39,7 @@ def submit_entry_order(
     risk_pct: float = 0.01,
 ) -> Optional[dict]:
     """
-    Submits a bracket order for an ENTRY signal.
+    Submits a bracket order for an ENTRY signal using order_class="bracket".
     
     Args:
         signal: scanner.signals.Signal object from detect_entry()
@@ -63,14 +63,21 @@ def submit_entry_order(
             print(f" [{signal.ticker}] Position size too small: {shares} shares")
             return None
         
-        # Bracket order: entry + auto take-profit + auto stop-loss
-        order = BracketOrderRequest(
+        # Bracket order via order_class parameter
+        order = MarketOrderRequest(
             symbol=signal.ticker,
             qty=shares,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
-            take_profit=dict(limit_price=signal.target_2r),
-            stop_loss=dict(stop_price=signal.stop),
+            order_class=OrderClass.BRACKET,
+            take_profit=LimitOrderRequest(
+                limit_price=signal.target_2r,
+                time_in_force=TimeInForce.GTC,
+            ),
+            stop_loss=MarketOrderRequest(
+                stop_price=signal.stop,
+                time_in_force=TimeInForce.GTC,
+            ),
         )
         
         resp = client.submit_order(order_data=order)
