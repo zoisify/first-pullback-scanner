@@ -1,8 +1,8 @@
 """
 scanner/pillars.py
 
-The 5-pillar universe filter from the transcript, scored per ticker.
-Uses Alpaca free tier for real-time bars and quote data.
+The 5-pillar universe filter, scored per ticker.
+Uses Alpaca for real-time bars and quote data.
 """
 
 from dotenv import load_dotenv
@@ -51,12 +51,16 @@ def _get_alpaca_client() -> tradeapi.REST:
 
 
 def get_bars(api: tradeapi.REST, ticker: str, limit: int = 60) -> pd.DataFrame:
+    """
+    Fetch 1-minute bars for a ticker.
+
+    Uses Alpaca's default feed (no explicit 'iex'), which is safer in CI.
+    """
     try:
         bars = api.get_bars(
             ticker,
             "1Min",
             limit=limit,
-            feed="iex",
             adjustment="raw",
         ).df
 
@@ -67,7 +71,7 @@ def get_bars(api: tradeapi.REST, ticker: str, limit: int = 60) -> pd.DataFrame:
         bars.columns = [c.capitalize() for c in bars.columns]
         return bars
     except Exception as e:
-        print(f"[{ticker}] bars error: {e}")
+        print(f"[{ticker}] bars error: {repr(e)}")
         return pd.DataFrame()
 
 
@@ -120,7 +124,6 @@ def score_ticker(
             ticker,
             "1Day",
             limit=2,
-            feed="iex",
             adjustment="raw",
         ).df
         prior_close = prev_bars["close"].iloc[-2] if len(prev_bars) >= 2 else open_price
@@ -135,7 +138,6 @@ def score_ticker(
             ticker,
             "1Day",
             limit=10,
-            feed="iex",
             adjustment="raw",
         ).df
         avg_daily_vol = hist["volume"].mean() if not hist.empty else total_vol
@@ -180,6 +182,6 @@ def score_ticker(
     }
 
 
-# Convenience function for code that just wants a client + score_ticker
 def get_alpaca_client() -> tradeapi.REST:
+    """Public helper to get the Alpaca client."""
     return _get_alpaca_client()
