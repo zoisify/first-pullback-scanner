@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import alpaca_trade_api as tradeapi
@@ -55,16 +54,19 @@ def get_bars(api: tradeapi.REST, ticker: str, limit: int = 60) -> pd.DataFrame:
     Fetch 1-minute bars for a ticker.
 
     Uses Alpaca's default feed (no explicit 'iex'), which is safer in CI.
+    Logs detailed errors so we can see why a symbol failed.
     """
     try:
-        bars = api.get_bars(
+        bars_req = api.get_bars(
             ticker,
             "1Min",
             limit=limit,
             adjustment="raw",
-        ).df
+        )
+        bars = bars_req.df
 
         if bars.empty:
+            print(f"[{ticker}] bars empty from Alpaca")
             return pd.DataFrame()
 
         bars.index = bars.index.tz_convert(ET)
@@ -120,28 +122,32 @@ def score_ticker(
 
     # Prior close for gap %
     try:
-        prev_bars = api.get_bars(
+        prev_bars_req = api.get_bars(
             ticker,
             "1Day",
             limit=2,
             adjustment="raw",
-        ).df
+        )
+        prev_bars = prev_bars_req.df
         prior_close = prev_bars["close"].iloc[-2] if len(prev_bars) >= 2 else open_price
-    except Exception:
+    except Exception as e:
+        print(f"[{ticker}] daily bars (prior_close) error: {repr(e)}")
         prior_close = open_price
 
     gap_pct = (open_price - prior_close) / prior_close if prior_close else 0.0
 
     # Relative volume
     try:
-        hist = api.get_bars(
+        hist_req = api.get_bars(
             ticker,
             "1Day",
             limit=10,
             adjustment="raw",
-        ).df
+        )
+        hist = hist_req.df
         avg_daily_vol = hist["volume"].mean() if not hist.empty else total_vol
-    except Exception:
+    except Exception as e:
+        print(f"[{ticker}] daily bars (hist) error: {repr(e)}")
         avg_daily_vol = total_vol
 
     expected_vol = avg_daily_vol * (elapsed_min / 390)
