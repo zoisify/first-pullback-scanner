@@ -5,7 +5,7 @@ name: Pre-Market Scan
 on:
   schedule:
     - cron: '0 11 * * 1-5'
-  workflow_dispatch:   # allows manual trigger from GitHub Actions tab
+  workflow_dispatch: # allows manual trigger from GitHub Actions tab
 
 jobs:
   scan:
@@ -32,8 +32,8 @@ jobs:
 
       - name: Run pre-market scan
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main_scan.py
 
@@ -44,3 +44,4 @@ jobs:
           name: scan-log-${{ github.run_id }}
           path: logs/
           retention-days: 30
+          if-no-files-found: warn
