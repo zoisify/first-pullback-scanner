@@ -54,7 +54,7 @@ def run_backtest(ticker: str, date: str, initial_capital: float = 10000) -> dict
     
     bars = get_historical_bars(ticker, date)
     if bars.empty:
-        return {"ticker": ticker, "date": date, "trades": 0, "pnl": 0}
+        return {"ticker": ticker, "date": date, "trades": 0, "pnl": 0, "trades_detail": []}
     
     # Simulate trading
     capital = initial_capital
@@ -231,7 +231,8 @@ def main():
     
     all_trades = []
     for stats in all_stats:
-        all_trades.extend(stats["trades_detail"])
+        if "trades_detail" in stats:
+            all_trades.extend(stats["trades_detail"])
     
     if all_trades:
         df = pd.DataFrame(all_trades)
