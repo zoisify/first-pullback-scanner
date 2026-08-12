@@ -38,6 +38,9 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main_session.py
 
+      - name: Ensure logs directory exists
+        run: mkdir -p logs
+
       - name: Upload session log
         if: always()
         uses: actions/upload-artifact@v4

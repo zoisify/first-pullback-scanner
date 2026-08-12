@@ -37,6 +37,9 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main_scan.py
 
+      - name: Ensure logs directory exists
+        run: mkdir -p logs
+
       - name: Upload scan log as artifact
         if: always()
         uses: actions/upload-artifact@v4
