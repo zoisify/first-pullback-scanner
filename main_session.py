@@ -18,7 +18,7 @@ Ross-style R:R + runners + daily walk-away:
     * Second exit indicator → sell remaining 40% (runner).
 - Daily walk-away rules (from transcript):
     * Stop taking new entries if:
-        - we’ve given back ≥ 50% of the day’s peak P&L, or
+        - we've given back ≥ 50% of the day's peak P&L, or
         - we hit MAX_DAILY_LOSS.
     * Still manage existing positions to exit, but no new trades.
 """
@@ -100,7 +100,9 @@ def main():
     print(f" Max daily loss: ${MAX_DAILY_LOSS:,.2f}")
     print(f"{'='*55}\n")
 
+    # api is now a tuple: (data_client, trading_client)
     api = _get_alpaca_client()
+    data_client, trading_client = api
 
     # Load pre-market candidates
     candidates = load_candidates()
@@ -121,13 +123,6 @@ def main():
 
     print(f" Monitoring {len(watchlist)} candidates: {', '.join(watchlist)}\n")
 
-    # Per-ticker position state:
-    # ticker → {
-    #   entry_price, stop, target_2r,
-    #   shares_total, shares_remaining,
-    #   entry_pnl_at_first_exit,
-    #   exits_fired: int
-    # }
     open_positions: dict[str, dict] = {}
     fired_entries: set[str] = set()
     total_entries: int = 0
@@ -136,7 +131,7 @@ def main():
     # Daily P&L tracking (walk-away logic)
     daily_pnl: float = 0.0
     peak_daily_pnl: float = 0.0
-    stopped_for_day: bool = False  # True once we hit walk-away condition
+    stopped_for_day: bool = False
 
     while True:
         now_et = datetime.now(ET)
@@ -150,13 +145,11 @@ def main():
                 )
                 send_daily_cutoff(total_entries)
 
-            # Force-exit any open positions (full exit, runner included)
             for ticker, pos in list(open_positions.items()):
-                bars = get_bars(api, ticker, limit=5)
+                bars = get_bars(data_client, ticker, limit=5)
                 exit_price = (
                     bars["Close"].iloc[-1] if not bars.empty else pos["entry_price"]
                 )
-                # P&L on remaining shares only
                 pnl = (exit_price - pos["entry_price"]) * pos["shares_remaining"]
                 daily_pnl += pnl
 
@@ -190,10 +183,7 @@ def main():
             notified_cutoff = True
             break
 
-        # ── Daily walk-away check (Ross-style) ────────────────────────────────
-        # Stop new entries if:
-        #   - given back >= 50% of peak daily P&L, or
-        #   - hit max daily loss.
+        # ── Daily walk-away check ─────────────────────────────────────────────
         if not stopped_for_day:
             if peak_daily_pnl > 0 and daily_pnl <= 0.5 * peak_daily_pnl:
                 print(
@@ -210,27 +200,24 @@ def main():
 
         # ── Poll each candidate ───────────────────────────────────────────────
         for ticker in watchlist:
-            bars = get_bars(api, ticker, limit=60)
+            bars = get_bars(data_client, ticker, limit=60)
             if bars.empty:
                 continue
 
             meta = candidate_map.get(ticker, {})
 
-            # ── Exit check (if in a paper position) ──────────────────────────
+            # ── Exit check ───────────────────────────────────────────────────
             if ticker in open_positions:
                 pos = open_positions[ticker]
                 exit_sig = detect_exit(bars, pos["entry_price"], pos["stop"], ticker)
 
                 if exit_sig and pos["shares_remaining"] > 0:
-                    # Compute P&L on remaining shares
                     pnl = (exit_sig.price - pos["entry_price"]) * pos["shares_remaining"]
                     daily_pnl += pnl
                     peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
 
                     if pos["exits_fired"] == 0:
-                        # First exit indicator: sell core (e.g. 60%), keep runner
-                        sell_frac = FIRST_EXIT_SELL_FRAC
-                        shares_to_sell = int(pos["shares_total"] * sell_frac)
+                        shares_to_sell = int(pos["shares_total"] * FIRST_EXIT_SELL_FRAC)
                         shares_remaining = pos["shares_total"] - shares_to_sell
                         partial = True
                         reason = f"{exit_sig.reason}_partial_core"
@@ -246,7 +233,6 @@ def main():
                             f"P&L on this chunk: ${pnl:,.2f}"
                         )
                     else:
-                        # Second exit indicator: sell rest (runner)
                         shares_to_sell = pos["shares_remaining"]
                         shares_remaining = 0
                         partial = False
@@ -283,16 +269,13 @@ def main():
                     if shares_remaining == 0:
                         del open_positions[ticker]
 
-                # NOTE: No 2R auto-exit here. We hold until an exit indicator fires.
-
                 continue
 
-            # ── Entry check ───────────────────────────────────────────────────
+            # ── Entry check ──────────────────────────────────────────────────
             if ticker in fired_entries:
-                continue  # already sent an entry for this ticker today
+                continue
 
             if stopped_for_day:
-                # Walk-away condition hit: no new entries, but still manage exists
                 continue
 
             live_candidate = dict(meta)
@@ -303,7 +286,6 @@ def main():
                 total_entries += 1
                 fired_entries.add(ticker)
 
-                # Position sizing from risk (Ross-style)
                 risk_per_share = entry_sig.risk_per_share
                 if risk_per_share <= 0:
                     continue
