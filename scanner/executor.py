@@ -17,7 +17,7 @@ Usage in main_session.py:
 import os
 from typing import Optional
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 
@@ -71,10 +71,12 @@ def submit_entry_order(
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
             take_profit=LimitOrderRequest(
+                qty=shares,
                 limit_price=signal.target_2r,
                 time_in_force=TimeInForce.GTC,
             ),
-            stop_loss=MarketOrderRequest(
+            stop_loss=StopOrderRequest(
+                qty=shares,
                 stop_price=signal.stop,
                 time_in_force=TimeInForce.GTC,
             ),
