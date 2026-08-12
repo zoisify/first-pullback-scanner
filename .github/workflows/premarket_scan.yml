@@ -1,16 +1,22 @@
-name: Pre-Market Scan
+name: Pre-Market Finviz Session
 
-# Runs at 11:00 UTC = 7:00 AM ET (handles both EST/EDT)
-# Monday–Friday only
 on:
   schedule:
-    - cron: '0 11 * * 1-5'
-  workflow_dispatch: # allows manual trigger from GitHub Actions tab
+    # 7:05 AM US Eastern (11:05 UTC) – adjust if you want
+    - cron: '5 11 * * 1-5'
+  workflow_dispatch: {}
 
 jobs:
-  scan:
+  premarket_session:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+
+    env:
+      # Match your actual secret names
+      APCA_API_KEY_ID:       ${{ secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY:   ${{ secrets.APCA_API_SECRET_KEY }}
+      DISCORD_WEBHOOK_URL:   ${{ secrets.DISCORD_WEBHOOK_URL }}
+      # If your code needs a base URL, hardcode or add a secret:
+      APCA_API_BASE_URL:     https://paper-api.alpaca.markets
 
     steps:
       - name: Checkout repo
@@ -21,30 +27,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run pre-market scan
-        env:
-          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
-          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python main_scan.py
+      - name: Build watchlist from Finviz
+        run: python build_watchlist.py
 
-      - name: Ensure logs directory exists
-        run: mkdir -p logs
-
-      - name: Upload scan log as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-log-${{ github.run_id }}
-          path: logs/
-          retention-days: 30
-          if-no-files-found: warn
+      - name: Run session monitor
+        run: python main_session.py
