@@ -1,0 +1,38 @@
+# First Pullback Scanner Watchlist
+# Add tickers below — one per line, no spaces
+# Build this list by saving every Finviz gap-scan hit each morning:
+# https://finviz.com/screener.ashx?v=111&f=sh_price_u20,sh_price_o2,ta_gap_u10&o=-gap
+#
+# These are historically active low-float momentum names (as of mid-2024).
+# Replace / expand as you find better candidates from your daily scans.
+TICKER
+MVIS
+IDEX
+CENN
+NKLA
+MULN
+WRAP
+GFAI
+BFRI
+MEGL
+SHOT
+WLDS
+LIFW
+SXTC
+ILUS
+NXTT
+ATNM
+ACMR
+SNDL
+AGRX
+CETX
+AQST
+EDSA
+GOVX
+WISA
+CODA
+VERB
+FRLN
+LIQT
+ELTX
+MGAM
