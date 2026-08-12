@@ -2,7 +2,6 @@ name: Pre-Market Finviz Session
 
 on:
   schedule:
-    # 7:05 AM US Eastern (11:05 UTC) – adjust if you want
     - cron: '5 11 * * 1-5'
   workflow_dispatch: {}
 
@@ -11,12 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Match your actual secret names
-      APCA_API_KEY_ID:       ${{ secrets.APCA_API_KEY_ID }}
-      APCA_API_SECRET_KEY:   ${{ secrets.APCA_API_SECRET_KEY }}
-      DISCORD_WEBHOOK_URL:   ${{ secrets.DISCORD_WEBHOOK_URL }}
-      # If your code needs a base URL, hardcode or add a secret:
-      APCA_API_BASE_URL:     https://paper-api.alpaca.markets
+      APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      APCA_API_BASE_URL: https://paper-api.alpaca.markets
 
     steps:
       - name: Checkout repo
