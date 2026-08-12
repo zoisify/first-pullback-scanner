@@ -71,12 +71,16 @@ def submit_entry_order(
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
             take_profit=LimitOrderRequest(
+                symbol=signal.ticker,
                 qty=shares,
+                side=OrderSide.SELL,
                 limit_price=signal.target_2r,
                 time_in_force=TimeInForce.GTC,
             ),
             stop_loss=StopOrderRequest(
+                symbol=signal.ticker,
                 qty=shares,
+                side=OrderSide.SELL,
                 stop_price=signal.stop,
                 time_in_force=TimeInForce.GTC,
             ),
