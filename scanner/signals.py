@@ -2,23 +2,30 @@
 scanner/signals.py
 
 Detects the "first pullback" entry signal on a 1-minute bar DataFrame.
-Returns structured signal dicts that notify.py formats for Discord.
 
-Entry rules (from transcript + systematization):
+Entry rules (Ross Cameron, improved):
 1. Stock has made a squeeze: moved >= 5% off a recent swing low
 2. Pullback: retraces <= 50% of the up-leg
-3. Pullback stays above 9 EMA AND above VWAP
+3. Pullback CLOSES above 9 EMA AND VWAP (wicks below allowed)
 4. Volume dries up on red pullback candles
 5. "Crossing candle": first candle whose HIGH exceeds the prior candle's HIGH
    → enter on that break; stop = pullback low
 
-Exit signals (Ross's exit indicators, systematized):
-- Stop hit
+Time weighting:
+- 7:00–9:30 AM ET: full confidence, all signals valid
+- 9:30–10:00 AM ET: only take signals with score >= 4 and gap >= 20%
+
+Exit signals:
+- Stop hit (or trailing stop hit)
 - Volume spike on red candle
 - Topping tail candle
-- Price closes below 9 EMA
-- Price closes below VWAP
+- Price CLOSES below 9 EMA
+- Price CLOSES below VWAP
 - Hard 10:00 AM ET cutoff (enforced in main_session.py)
+
+Trailing stop:
+- After first partial exit, trailing stop moves up to lock in profit
+- Trail = highest close since entry minus original risk amount
 """
 
 import pandas as pd
@@ -66,8 +73,16 @@ def detect_entry(candidate: dict, squeeze_threshold: float = 0.05,
     bars["VWAP"] = vwap(bars)
 
     ticker = candidate["ticker"]
+    score = candidate.get("score", 0)
+    gap_pct = candidate.get("gap_pct", 0)
 
-    # Hard 10:00 AM cutoff handled in session; entry function assumes it's OK to enter
+    # ── Time of entry weighting ───────────────────────────────────────────────
+    now_et = datetime.now(ET)
+    after_930 = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+    if after_930:
+        # After 9:30 AM ET only take the strongest setups
+        if score < 4 or gap_pct < 20:
+            return None
 
     window = bars.tail(30)
     leg_low_idx = window["Low"].idxmin()
@@ -93,11 +108,13 @@ def detect_entry(candidate: dict, squeeze_threshold: float = 0.05,
     if pb_retrace > max_retrace:
         return None
 
-    pb_below_ema = (pullback["Close"] < pullback["EMA9"]).any()
-    pb_below_vwap = (pullback["Close"] < pullback["VWAP"]).any()
-    if pb_below_ema or pb_below_vwap:
+    # ── Relaxed EMA/VWAP check — closes must be above, wicks allowed ─────────
+    pb_close_below_ema = (pullback["Close"] < pullback["EMA9"]).any()
+    pb_close_below_vwap = (pullback["Close"] < pullback["VWAP"]).any()
+    if pb_close_below_ema or pb_close_below_vwap:
         return None
 
+    # ── Volume dry-up on pullback ─────────────────────────────────────────────
     recent_green = window[window["Close"] > window["Open"]]["Volume"].tail(5)
     pb_red = pullback[pullback["Close"] < pullback["Open"]]["Volume"]
     if not recent_green.empty and not pb_red.empty:
@@ -106,6 +123,7 @@ def detect_entry(candidate: dict, squeeze_threshold: float = 0.05,
         if avg_red_vol > avg_green_vol:
             return None
 
+    # ── Crossing candle ───────────────────────────────────────────────────────
     last_bar = bars.iloc[-1]
     prev_bar = bars.iloc[-2]
     crosses_high = last_bar["High"] > prev_bar["High"]
@@ -130,11 +148,11 @@ def detect_entry(candidate: dict, squeeze_threshold: float = 0.05,
         target_2r=target_2r,
         risk_per_share=round(risk, 2),
         reason="first_pullback_crossing_candle",
-        pillars=candidate["pillars"],
-        score=candidate["score"],
-        gap_pct=candidate["gap_pct"],
-        rel_vol=candidate["rel_vol"],
-        total_vol=candidate["total_vol"],
+        pillars=candidate.get("pillars", {}),
+        score=score,
+        gap_pct=gap_pct,
+        rel_vol=candidate.get("rel_vol", 0),
+        total_vol=candidate.get("total_vol", 0),
     )
 
 
@@ -151,28 +169,58 @@ def detect_exit(bars: pd.DataFrame, entry_price: float,
     price = last["Close"]
     is_red = price < last["Open"]
 
+    # Stop hit
     if last["Low"] <= stop_price:
         return Signal(type="EXIT", ticker=ticker, price=stop_price,
                       reason="stop_loss")
 
+    # Volume spike on red candle
     recent_green = bars[bars["Close"] > bars["Open"]]["Volume"].tail(5)
     avg_green_vol = recent_green.mean() if not recent_green.empty else last["Volume"]
     if is_red and last["Volume"] > 1.5 * avg_green_vol:
         return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
                       reason="vol_spike_seller")
 
+    # Topping tail
     rng = last["High"] - last["Low"]
     upper_wick = last["High"] - max(price, last["Open"])
     if rng > 0 and (upper_wick / rng) >= 0.50 and is_red:
         return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
                       reason="topping_tail")
 
+    # Close below 9 EMA (relaxed — close only, not wick)
     if price < last["EMA9"]:
         return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
                       reason="below_ema9")
 
+    # Close below VWAP
     if price < last["VWAP"]:
         return Signal(type="EXIT", ticker=ticker, price=round(price, 2),
                       reason="below_vwap")
 
     return None
+
+
+def calc_trailing_stop(bars: pd.DataFrame, entry_price: float,
+                        original_risk: float, trail_multiplier: float = 1.0) -> float:
+    """
+    Calculate a trailing stop for the runner position.
+    Trails at (highest close since entry) minus (original risk amount * trail_multiplier).
+    Never goes below the original stop.
+
+    Args:
+        bars: 1-min bars since entry
+        entry_price: original entry price
+        original_risk: entry_price - original_stop
+        trail_multiplier: how tight to trail (1.0 = 1R below highest close)
+
+    Returns:
+        New trailing stop price (float)
+    """
+    if bars.empty:
+        return entry_price - original_risk
+
+    highest_close = bars["Close"].max()
+    trailing = highest_close - (original_risk * trail_multiplier)
+    original_stop = entry_price - original_risk
+    return round(max(trailing, original_stop), 2)
