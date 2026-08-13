@@ -2,25 +2,20 @@
 main_session.py
 
 Session monitor — called by session_monitor.yml.
-Runs from 7:05 AM ET until 10:00 AM ET hard cutoff.
+Runs from 7:15 AM ET until 10:00 AM ET hard cutoff.
 Polls every 60 seconds for first-pullback entry/exit signals.
 Sends Discord notifications on signal fire.
-Logs every signal and skip to logs/session_YYYYMMDD.csv.
+Logs every signal to logs/session_YYYYMMDD.csv.
 
 Ross-style R:R + runners + daily walk-away:
 - Risk per trade: 1% of account (RISK_PCT).
-- Stop: pullback low (with tiny buffer).
-- Target_2r: tracked but NOT used as a hard exit.
-- Exit only when an exit indicator fires (stop, topping tail, below EMA/VWAP, vol spike)
-  or at the 10:00 AM hard cutoff.
+- Stop: pullback low (with tiny buffer) — submitted as separate stop order.
+- NO hard 2R exit — exit only on indicators or 10 AM cutoff.
 - Partial sells:
-    * First exit indicator → sell 60% of shares (core).
+    * First exit indicator → sell 60% (core), cancel stop, resubmit stop on runner.
     * Second exit indicator → sell remaining 40% (runner).
-- Daily walk-away rules (from transcript):
-    * Stop taking new entries if:
-        - we've given back ≥ 50% of the day's peak P&L, or
-        - we hit MAX_DAILY_LOSS.
-    * Still manage existing positions to exit, but no new trades.
+- Daily walk-away:
+    * Stop new entries if given back >= 50% of peak P&L or hit MAX_DAILY_LOSS.
 """
 
 import os
@@ -36,25 +31,20 @@ from scanner.notify import (
     send_entry_signal, send_exit_signal,
     send_daily_cutoff, send_no_candidates,
 )
+from scanner.executor import submit_entry_order, submit_exit_order
 
 ET = ZoneInfo("America/New_York")
 LOG_DIR = "logs"
-POLL_SEC = 60  # poll every 60 seconds
-CUTOFF_H = 10  # Ross's hard 10:00 AM cutoff
+POLL_SEC = 60
+CUTOFF_H = 10
 
-# Risk & money management
-RISK_PCT = 0.01  # 1% of account per trade
-ACCOUNT_EQUITY = 65_000.0  # set this to your current sim account size
-MAX_DAILY_LOSS = 2_000.0   # e.g. ~1–2% of account; adjust to your comfort
+RISK_PCT = 0.01
+ACCOUNT_EQUITY = 65_000.0
+MAX_DAILY_LOSS = 2_000.0
+FIRST_EXIT_SELL_FRAC = 0.6
 
-# Runner / partials
-FIRST_EXIT_SELL_FRAC = 0.6  # sell 60% on first exit indicator (core)
-# remaining 40% is the runner, sold on next indicator or cutoff
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def load_candidates() -> list[dict]:
-    """Load candidates saved by main_scan.py this morning."""
     date_str = datetime.now(ET).strftime("%Y%m%d")
     path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
     if not os.path.exists(path):
@@ -63,6 +53,7 @@ def load_candidates() -> list[dict]:
         return []
     with open(path) as f:
         return json.load(f)
+
 
 def load_watchlist() -> list[str]:
     path = "data/watchlist.csv"
@@ -74,6 +65,7 @@ def load_watchlist() -> list[str]:
             for r in csv.reader(f)
             if r and r[0].strip() and not r[0].startswith("#") and r[0].strip() != "TICKER"
         ]
+
 
 def log_signal(row: dict):
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -91,7 +83,6 @@ def log_signal(row: dict):
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in fields})
 
-# ── Main session loop ──────────────────────────────────────────────────────────
 
 def main():
     print(f"\n{'='*55}")
@@ -100,11 +91,9 @@ def main():
     print(f" Max daily loss: ${MAX_DAILY_LOSS:,.2f}")
     print(f"{'='*55}\n")
 
-    # api is now a tuple: (data_client, trading_client)
     api = _get_alpaca_client()
     data_client, trading_client = api
 
-    # Load pre-market candidates
     candidates = load_candidates()
     if not candidates:
         print(" No pre-market candidates found — running live scan of watchlist …")
@@ -123,12 +112,18 @@ def main():
 
     print(f" Monitoring {len(watchlist)} candidates: {', '.join(watchlist)}\n")
 
+    # Per-ticker position state:
+    # ticker → {
+    #   entry_price, stop, target_2r,
+    #   shares_total, shares_remaining,
+    #   exits_fired, entry_pnl_at_first_exit,
+    #   order_id, stop_order_id
+    # }
     open_positions: dict[str, dict] = {}
     fired_entries: set[str] = set()
     total_entries: int = 0
     notified_cutoff: bool = False
 
-    # Daily P&L tracking (walk-away logic)
     daily_pnl: float = 0.0
     peak_daily_pnl: float = 0.0
     stopped_for_day: bool = False
@@ -139,17 +134,12 @@ def main():
         # ── Hard 10:00 AM cutoff ──────────────────────────────────────────────
         if now_et.hour >= CUTOFF_H:
             if not notified_cutoff:
-                print(
-                    f"\n 10:00 AM cutoff reached — no new entries. "
-                    f"Total signals: {total_entries}"
-                )
+                print(f"\n 10:00 AM cutoff — Total signals: {total_entries}")
                 send_daily_cutoff(total_entries)
 
             for ticker, pos in list(open_positions.items()):
                 bars = get_bars(data_client, ticker, limit=5)
-                exit_price = (
-                    bars["Close"].iloc[-1] if not bars.empty else pos["entry_price"]
-                )
+                exit_price = bars["Close"].iloc[-1] if not bars.empty else pos["entry_price"]
                 pnl = (exit_price - pos["entry_price"]) * pos["shares_remaining"]
                 daily_pnl += pnl
 
@@ -159,6 +149,14 @@ def main():
                     price=exit_price,
                     reason="hard_cutoff",
                 )
+
+                # Submit market sell for remaining shares
+                submit_exit_order(
+                    exit_sig,
+                    current_qty=pos["shares_remaining"],
+                    stop_order_id=pos.get("stop_order_id"),
+                )
+
                 send_exit_signal(exit_sig, pos["entry_price"], pnl)
                 log_signal({
                     "timestamp": now_et.isoformat(),
@@ -166,7 +164,7 @@ def main():
                     "action": "EXIT",
                     "price": exit_price,
                     "reason": "hard_cutoff",
-                    "risk_per_share": pnl / pos["shares_total"],
+                    "risk_per_share": pnl / pos["shares_total"] if pos["shares_total"] else 0,
                     "shares": pos["shares_remaining"],
                     "partial": False,
                     "daily_pnl": daily_pnl,
@@ -186,16 +184,10 @@ def main():
         # ── Daily walk-away check ─────────────────────────────────────────────
         if not stopped_for_day:
             if peak_daily_pnl > 0 and daily_pnl <= 0.5 * peak_daily_pnl:
-                print(
-                    "\n Walk-away: given back >= 50% of peak daily P&L. "
-                    "No new entries for the rest of the day."
-                )
+                print("\n Walk-away: given back >= 50% of peak P&L. No new entries.")
                 stopped_for_day = True
             elif daily_pnl <= -MAX_DAILY_LOSS:
-                print(
-                    "\n Walk-away: max daily loss hit. "
-                    "No new entries for the rest of the day."
-                )
+                print("\n Walk-away: max daily loss hit. No new entries.")
                 stopped_for_day = True
 
         # ── Poll each candidate ───────────────────────────────────────────────
@@ -217,6 +209,7 @@ def main():
                     peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
 
                     if pos["exits_fired"] == 0:
+                        # First exit: sell core (60%), keep runner (40%)
                         shares_to_sell = int(pos["shares_total"] * FIRST_EXIT_SELL_FRAC)
                         shares_remaining = pos["shares_total"] - shares_to_sell
                         partial = True
@@ -225,25 +218,58 @@ def main():
                         pos["shares_remaining"] = shares_remaining
                         pos["entry_pnl_at_first_exit"] = pnl
 
+                        # Cancel old stop, submit sell for core shares
+                        submit_exit_order(
+                            exit_sig,
+                            current_qty=shares_to_sell,
+                            stop_order_id=pos.get("stop_order_id"),
+                        )
+                        pos["stop_order_id"] = None  # old stop cancelled
+
+                        # Resubmit stop for runner shares only
+                        if shares_remaining > 0:
+                            from alpaca.trading.requests import StopOrderRequest
+                            from alpaca.trading.enums import OrderSide, TimeInForce
+                            from scanner.executor import get_trading_client
+                            try:
+                                tc = get_trading_client()
+                                runner_stop = StopOrderRequest(
+                                    symbol=ticker,
+                                    qty=shares_remaining,
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.DAY,
+                                    stop_price=round(pos["stop"], 2),
+                                )
+                                r = tc.submit_order(order_data=runner_stop)
+                                pos["stop_order_id"] = r.id
+                                print(f" Runner stop resubmitted: {r.id} ({shares_remaining} shares)")
+                            except Exception as e:
+                                print(f" [WARN] Could not resubmit runner stop: {e}")
+
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (partial) {ticker} "
-                            f"@${exit_sig.price} ({reason}) "
-                            f"sold {shares_to_sell} shares, "
-                            f"keeping {shares_remaining} runner. "
-                            f"P&L on this chunk: ${pnl:,.2f}"
+                            f"@${exit_sig.price} — sold {shares_to_sell}, "
+                            f"keeping {shares_remaining} runner. P&L: ${pnl:,.2f}"
                         )
+
                     else:
+                        # Second exit: sell runner
                         shares_to_sell = pos["shares_remaining"]
                         shares_remaining = 0
                         partial = False
                         reason = f"{exit_sig.reason}_full_runner"
                         pos["shares_remaining"] = 0
 
+                        submit_exit_order(
+                            exit_sig,
+                            current_qty=shares_to_sell,
+                            stop_order_id=pos.get("stop_order_id"),
+                        )
+
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (runner) {ticker} "
-                            f"@${exit_sig.price} ({reason}) "
-                            f"sold {shares_to_sell} shares. "
-                            f"Total trade P&L: ${pnl:,.2f}"
+                            f"@${exit_sig.price} — sold {shares_to_sell}. "
+                            f"Total P&L: ${pnl:,.2f}"
                         )
 
                     send_exit_signal(exit_sig, pos["entry_price"], pnl)
@@ -253,7 +279,7 @@ def main():
                         "action": "EXIT",
                         "price": exit_sig.price,
                         "reason": reason,
-                        "risk_per_share": pnl / pos["shares_total"],
+                        "risk_per_share": pnl / pos["shares_total"] if pos["shares_total"] else 0,
                         "shares": shares_to_sell,
                         "partial": partial,
                         "daily_pnl": daily_pnl,
@@ -286,6 +312,13 @@ def main():
                 total_entries += 1
                 fired_entries.add(ticker)
 
+                # Submit paper trade order
+                order_result = submit_entry_order(
+                    entry_sig,
+                    account_size=ACCOUNT_EQUITY,
+                    risk_pct=RISK_PCT,
+                )
+
                 risk_per_share = entry_sig.risk_per_share
                 if risk_per_share <= 0:
                     continue
@@ -300,6 +333,8 @@ def main():
                     "shares_remaining": shares_total,
                     "exits_fired": 0,
                     "entry_pnl_at_first_exit": 0.0,
+                    "order_id": order_result["order_id"] if order_result else None,
+                    "stop_order_id": order_result["stop_order_id"] if order_result else None,
                 }
 
                 print(
@@ -329,11 +364,11 @@ def main():
             else:
                 print(f" {now_et.strftime('%H:%M')} {ticker} no signal", flush=True)
 
-        # ── Wait before next poll ─────────────────────────────────────────────
         print(f" — sleeping {POLL_SEC}s …", flush=True)
         time.sleep(POLL_SEC)
 
     print(" Session monitor complete.")
+
 
 if __name__ == "__main__":
     main()
