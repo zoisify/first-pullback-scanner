@@ -19,6 +19,7 @@ load_dotenv()
 import os
 import csv
 import json
+import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,18 @@ from scanner.notify import send_scan_summary, send_no_candidates
 
 ET = ZoneInfo("America/New_York")
 LOG_DIR = "logs"
+
+
+class _Encoder(json.JSONEncoder):
+    """Handles numpy int64/float64 types that standard json can't serialize."""
+    def default(self, o):
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
 
 
 def save_scan_log(candidates: list[dict], all_results: list[dict]):
@@ -62,7 +75,7 @@ def save_scan_log(candidates: list[dict], all_results: list[dict]):
                         for c in candidates]
     json_path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
     with open(json_path, "w") as f:
-        json.dump(candidates_clean, f, indent=2)
+        json.dump(candidates_clean, f, indent=2, cls=_Encoder)
 
     print(f" Scan log: {path}")
     print(f" Candidates: {json_path}")
