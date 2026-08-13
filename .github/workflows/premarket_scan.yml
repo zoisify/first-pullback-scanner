@@ -26,8 +26,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build watchlist from Finviz
-        run: python build_watchlist.py
+      - name: Run pre-market scan
+        run: python main_scan.py
 
       - name: Run session monitor
         run: python main_session.py
