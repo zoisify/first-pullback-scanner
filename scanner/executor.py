@@ -5,11 +5,12 @@ Order execution layer for Alpaca paper trading.
 Uses the modern alpaca-py SDK with typed request objects.
 
 Strategy (Ross Cameron first pullback):
-- Entry: plain market buy
+- Entry: plain market buy + bid/ask spread check
 - Stop: separate stop order at pullback low
 - NO bracket / NO hard 2R exit — let indicators handle exits
 - Exit partial (60%) on first indicator via market sell
 - Exit runner (40%) on second indicator or 10 AM cutoff
+- Trailing stop: updated every poll on runner position
 """
 
 import os
@@ -30,18 +31,56 @@ def get_trading_client() -> TradingClient:
     )
 
 
+def check_spread(ticker: str, max_spread_pct: float = 0.02) -> bool:
+    """
+    Check bid/ask spread is tight enough to enter.
+    Returns True if spread is acceptable, False if too wide.
+    Max spread default: 2% of mid price.
+    """
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        data_client = StockHistoricalDataClient(
+            os.environ["ALPACA_API_KEY"],
+            os.environ["ALPACA_SECRET_KEY"],
+        )
+        request = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+        quote = data_client.get_stock_latest_quote(request)[ticker]
+
+        bid = quote.bid_price
+        ask = quote.ask_price
+        if not bid or not ask or bid <= 0:
+            return True  # can't check, allow through
+
+        spread_pct = (ask - bid) / ((ask + bid) / 2)
+        if spread_pct > max_spread_pct:
+            print(f" [{ticker}] Spread too wide: {spread_pct:.1%} (bid={bid}, ask={ask})")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f" [{ticker}] Spread check failed: {e} — allowing through")
+        return True
+
+
 def submit_entry_order(
     signal,
     account_size: float = 65_000,
     risk_pct: float = 0.01,
 ) -> Optional[dict]:
     """
-    Submits a market buy + separate stop loss order on entry signal.
+    Checks spread, then submits a market buy + separate stop loss order.
     No bracket / no 2R hard exit — exits handled by indicator detection.
 
     Returns dict with order_id, stop_order_id, shares on success, else None.
     """
     try:
+        # Spread check before entering
+        if not check_spread(signal.ticker):
+            return None
+
         client = get_trading_client()
 
         risk_per_share = signal.price - signal.stop
@@ -95,10 +134,7 @@ def submit_exit_order(
 ) -> Optional[dict]:
     """
     Submits a market sell for current_qty shares.
-    Cancels the stop order first if stop_order_id is provided,
-    so we don't double-sell.
-
-    Returns dict with order_id and shares on success, else None.
+    Cancels the stop order first to avoid double-sell.
     """
     try:
         client = get_trading_client()
@@ -128,6 +164,44 @@ def submit_exit_order(
     except Exception as e:
         print(f" [ERROR] Exit order failed for {signal.ticker}: {e}")
         return None
+
+
+def update_trailing_stop(
+    ticker: str,
+    current_qty: int,
+    old_stop_order_id: Optional[str],
+    new_stop_price: float,
+) -> Optional[str]:
+    """
+    Cancels the old stop order and submits a new one at new_stop_price.
+    Used to trail the stop up as price moves in our favour.
+    Returns new stop_order_id on success, None on failure.
+    """
+    try:
+        client = get_trading_client()
+
+        # Cancel old stop
+        if old_stop_order_id:
+            try:
+                client.cancel_order_by_id(old_stop_order_id)
+            except Exception:
+                pass
+
+        # Submit new stop at higher price
+        stop_order = StopOrderRequest(
+            symbol=ticker,
+            qty=current_qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=round(new_stop_price, 2),
+        )
+        resp = client.submit_order(order_data=stop_order)
+        print(f" TRAILING STOP updated: ${new_stop_price} ({ticker})")
+        return resp.id
+
+    except Exception as e:
+        print(f" [WARN] Trailing stop update failed for {ticker}: {e}")
+        return old_stop_order_id
 
 
 def get_current_position_qty(ticker: str) -> int:
