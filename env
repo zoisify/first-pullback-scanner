@@ -1,8 +1,0 @@
-# Alpaca Paper Trading Credentials
-# Get these from: https://app.alpaca.markets/paper/dashboard
-APCA_API_KEY_ID=paper_YOUR_KEY_HERE
-APCA_API_SECRET_KEY=YOUR_SECRET_HERE
-
-# Discord Webhook URL
-# Create one in your Discord server: Server Settings > Integrations > Webhooks
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
