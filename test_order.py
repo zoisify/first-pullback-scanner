@@ -25,8 +25,8 @@ buy = client.submit_order(MarketOrderRequest(
 ))
 print(f"BUY order submitted: {buy.id}")
 
-print("Waiting 60 seconds...")
-time.sleep(60)
+print("Waiting 30 seconds...")
+time.sleep(30)
 
 # Sell 1 share
 print(f"Selling 1 share of {TICKER}...")
