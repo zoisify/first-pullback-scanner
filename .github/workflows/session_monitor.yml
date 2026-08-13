@@ -1,17 +1,16 @@
 name: Session Monitor (7–10 AM ET)
-
-# Starts at 11:05 UTC (just after pre-market scan)
+# Starts at 11:15 UTC (10 mins after pre-market scan)
 # Runs until 10:00 AM ET = 14:00 UTC
 # The Python script itself enforces the 10:00 AM hard cutoff
 on:
   schedule:
-    - cron: '5 11 * * 1-5'
+    - cron: '15 11 * * 1-5'
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 180 # 3 hours — covers 7:05 AM to 10:05 AM ET
+    timeout-minutes: 180 # 3 hours — covers 7:15 AM to 10:15 AM ET
 
     steps:
       - name: Checkout repo
