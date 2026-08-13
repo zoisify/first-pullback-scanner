@@ -200,12 +200,13 @@ def score_ticker(
 def _get_float_yfinance(ticker: str) -> int | None:
     """
     Try to get float shares from yfinance.
-    Returns shares float (int) or None on failure.
+    Uses floatShares (actual float) not sharesOutstanding.
+    Returns float share count (int) or None on failure.
     """
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).fast_info
-        return getattr(info, "shares", None)
+        info = yf.Ticker(ticker).info
+        return info.get("floatShares") or info.get("sharesOutstanding")
     except Exception:
         return None
 
