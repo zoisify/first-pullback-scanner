@@ -2,139 +2,139 @@
 scanner/executor.py
 
 Order execution layer for Alpaca paper trading.
-Uses the modern alpaca-py SDK (v0.26.0) with typed request objects.
+Uses the modern alpaca-py SDK with typed request objects.
 
-Usage in main_session.py:
-    from scanner.executor import submit_entry_order, submit_exit_order
-    
-    # On entry signal:
-    submit_entry_order(entry_sig, account_size=10_000, risk_pct=0.01)
-    
-    # On exit signal:
-    submit_exit_order(exit_sig, current_qty=position_shares[ticker])
+Strategy (Ross Cameron first pullback):
+- Entry: plain market buy
+- Stop: separate stop order at pullback low
+- NO bracket / NO hard 2R exit — let indicators handle exits
+- Exit partial (60%) on first indicator via market sell
+- Exit runner (40%) on second indicator or 10 AM cutoff
 """
 
 import os
 from typing import Optional
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    StopOrderRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 
 def get_trading_client() -> TradingClient:
-    """
-    Instantiate TradingClient using env vars.
-    Make sure APCA_API_KEY_ID and APCA_API_SECRET_KEY are set in GitHub Actions secrets.
-    """
     return TradingClient(
-        api_key=os.environ["APCA_API_KEY_ID"],
-        secret_key=os.environ["APCA_API_SECRET_KEY"],
+        api_key=os.environ["ALPACA_API_KEY"],
+        secret_key=os.environ["ALPACA_SECRET_KEY"],
         paper=True,
     )
 
 
 def submit_entry_order(
     signal,
-    account_size: float = 10_000,
+    account_size: float = 65_000,
     risk_pct: float = 0.01,
 ) -> Optional[dict]:
     """
-    Submits a bracket order for an ENTRY signal using order_class="bracket".
-    
-    Args:
-        signal: scanner.signals.Signal object from detect_entry()
-        account_size: total account value in USD (adjust to your actual balance)
-        risk_pct: fraction of account to risk per trade (default 1%)
-    
-    Returns:
-        Order response dict on success, None on failure.
+    Submits a market buy + separate stop loss order on entry signal.
+    No bracket / no 2R hard exit — exits handled by indicator detection.
+
+    Returns dict with order_id, stop_order_id, shares on success, else None.
     """
     try:
         client = get_trading_client()
-        
-        # Size the position: risk = entry - stop; shares = (account * risk_pct) / risk
+
         risk_per_share = signal.price - signal.stop
         if risk_per_share <= 0:
             print(f" [{signal.ticker}] Invalid risk: entry={signal.price}, stop={signal.stop}")
             return None
-        
+
         shares = int((account_size * risk_pct) / risk_per_share)
         if shares <= 0:
-            print(f" [{signal.ticker}] Position size too small: {shares} shares")
+            print(f" [{signal.ticker}] Position size too small")
             return None
-        
-        # Bracket order via order_class parameter
-        order = MarketOrderRequest(
+
+        # 1. Market buy
+        buy_order = MarketOrderRequest(
             symbol=signal.ticker,
             qty=shares,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(
-                limit_price=signal.target_2r,
-                time_in_force=TimeInForce.GTC,
-            ),
-            stop_loss=StopLossRequest(
-                stop_price=signal.stop,
-                time_in_force=TimeInForce.GTC,
-            ),
         )
-        
-        resp = client.submit_order(order_data=order)
-        print(f" ORDER SUBMITTED: {resp.id} — {shares}x {signal.ticker} @ {signal.price}")
-        print(f"   Stop: {signal.stop} | Target 2R: {signal.target_2r}")
-        return {"order_id": resp.id, "shares": shares, "symbol": signal.ticker}
-    
+        buy_resp = client.submit_order(order_data=buy_order)
+        print(f" BUY ORDER: {buy_resp.id} — {shares}x {signal.ticker}")
+        print(f"   Entry ~${signal.price} | Stop ${signal.stop} | 2R ref ${signal.target_2r}")
+
+        # 2. Separate stop loss order
+        stop_order = StopOrderRequest(
+            symbol=signal.ticker,
+            qty=shares,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=round(signal.stop, 2),
+        )
+        stop_resp = client.submit_order(order_data=stop_order)
+        print(f" STOP ORDER: {stop_resp.id} — stop at ${signal.stop}")
+
+        return {
+            "order_id": buy_resp.id,
+            "stop_order_id": stop_resp.id,
+            "shares": shares,
+            "symbol": signal.ticker,
+        }
+
     except Exception as e:
-        print(f" [ERROR] Failed to submit entry order for {signal.ticker}: {e}")
+        print(f" [ERROR] Entry order failed for {signal.ticker}: {e}")
         return None
 
 
 def submit_exit_order(
     signal,
     current_qty: int,
+    stop_order_id: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Submits a market sell order to close a position on EXIT signal.
-    
-    Args:
-        signal: scanner.signals.Signal object from detect_exit()
-        current_qty: number of shares currently held (from position tracking)
-    
-    Returns:
-        Order response dict on success, None on failure.
+    Submits a market sell for current_qty shares.
+    Cancels the stop order first if stop_order_id is provided,
+    so we don't double-sell.
+
+    Returns dict with order_id and shares on success, else None.
     """
     try:
         client = get_trading_client()
-        
+
         if current_qty <= 0:
-            print(f" [{signal.ticker}] No shares to exit (qty={current_qty})")
+            print(f" [{signal.ticker}] No shares to sell (qty={current_qty})")
             return None
-        
+
+        # Cancel existing stop order to avoid double-fill
+        if stop_order_id:
+            try:
+                client.cancel_order_by_id(stop_order_id)
+                print(f" Cancelled stop order {stop_order_id}")
+            except Exception:
+                pass  # may already be filled or cancelled
+
         order = MarketOrderRequest(
             symbol=signal.ticker,
             qty=current_qty,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        
         resp = client.submit_order(order_data=order)
-        print(f" ORDER SUBMITTED (EXIT): {resp.id} — {current_qty}x {signal.ticker} @ {signal.price}")
+        print(f" SELL ORDER: {resp.id} — {current_qty}x {signal.ticker} @ ~${signal.price}")
         return {"order_id": resp.id, "shares": current_qty, "symbol": signal.ticker}
-    
+
     except Exception as e:
-        print(f" [ERROR] Failed to submit exit order for {signal.ticker}: {e}")
+        print(f" [ERROR] Exit order failed for {signal.ticker}: {e}")
         return None
 
 
 def get_current_position_qty(ticker: str) -> int:
-    """
-    Query Alpaca for the current position size of a ticker.
-    Returns 0 if no position exists.
-    """
+    """Query Alpaca for current position size. Returns 0 if no position."""
     try:
         client = get_trading_client()
         position = client.get_open_position(ticker)
-        return int(position.qty) if position else 0
+        return int(float(position.qty)) if position else 0
     except Exception:
         return 0
