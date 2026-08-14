@@ -1,16 +1,9 @@
 """
 scanner/pillars.py
 
-The 5-pillar universe filter from the transcript, scored per ticker.
-Uses alpaca-py (new SDK) for real-time bars and quote data.
-Float lookup via Financial Modeling Prep (FMP) free API.
-
-Ross's pillars:
-1. Relative volume >= 5x
-2. Gap >= 10% from prior close
-3. Price between $2 and $20
-4. Float <= 20 million shares
-5. Total volume >= 100K
+Five-pillar evaluation for every raw gapper.
+FMP float data remains optional and is normally requested only for the
+selected candidate to avoid unnecessary API usage.
 """
 
 import os
@@ -28,10 +21,8 @@ def get_alpaca_client():
 
     api_key = os.environ["ALPACA_API_KEY"]
     secret_key = os.environ["ALPACA_SECRET_KEY"]
-
     data_client = StockHistoricalDataClient(api_key, secret_key)
     trading_client = TradingClient(api_key, secret_key, paper=True)
-
     return data_client, trading_client
 
 
@@ -41,33 +32,21 @@ def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
 
     try:
         now = datetime.now(ET)
-        start = now - timedelta(minutes=limit + 10)
-
         request = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame.Minute,
-            start=start,
+            start=now - timedelta(minutes=limit + 10),
             end=now,
             feed="iex",
         )
-
-        bars_response = api.get_stock_bars(request)
-        df = bars_response.df
-
+        df = api.get_stock_bars(request).df
         if df.empty:
             return pd.DataFrame()
-
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(ticker, level="symbol")
-
         df.index = df.index.tz_convert(ET)
         df.columns = [c.capitalize() for c in df.columns]
-
-        today = datetime.now(ET).date()
-        df = df[df.index.date == today]
-
-        return df.tail(limit)
-
+        return df[df.index.date == now.date()].tail(limit)
     except Exception as e:
         print(f"[{ticker}] bars error: {e}")
         return pd.DataFrame()
@@ -82,49 +61,40 @@ def get_asset_info(api, ticker: str) -> dict:
 
 
 def get_float_fmp(ticker: str) -> int | None:
-    """
-    Get float shares from Financial Modeling Prep free API.
-    Called only on the single #1 gapper so no rate limit issues.
-    Returns float share count or None on failure.
-    """
     try:
         api_key = os.environ.get("FMP_API_KEY", "")
         if not api_key:
-            print(f" [FMP] No FMP_API_KEY set - skipping float lookup")
+            print(" [FMP] No FMP_API_KEY set - skipping float lookup")
             return None
 
         url = f"https://financialmodelingprep.com/stable/shares-float?symbol={ticker}&apikey={api_key}"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
-        if isinstance(data, list) and len(data) > 0:
-            float_shares = data[0].get("floatShares")
-            if float_shares:
-                print(f" [FMP] {ticker} float: {int(float_shares):,}")
-                return int(float_shares)
+        if isinstance(data, list) and data:
+            value = data[0].get("floatShares")
+            if value:
+                print(f" [FMP] {ticker} float: {int(value):,}")
+                return int(value)
 
-        # Fallback: profile endpoint
-        url2 = f"https://financialmodelingprep.com/stable/profile?symbol={ticker}&apikey={api_key}"
-        r2 = requests.get(url2, timeout=10)
-        r2.raise_for_status()
-        data2 = r2.json()
-
-        if isinstance(data2, list) and len(data2) > 0:
-            shares = data2[0].get("floatShares") or data2[0].get("sharesOutstanding")
-            if shares:
-                print(f" [FMP] {ticker} shares (profile): {int(shares):,}")
-                return int(shares)
+        fallback = f"https://financialmodelingprep.com/stable/profile?symbol={ticker}&apikey={api_key}"
+        response = requests.get(fallback, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and data:
+            value = data[0].get("floatShares") or data[0].get("sharesOutstanding")
+            if value:
+                print(f" [FMP] {ticker} shares (profile): {int(value):,}")
+                return int(value)
 
         print(f" [FMP] No float data found for {ticker}")
-        return None
-
     except Exception as e:
         print(f" [FMP] Float lookup failed for {ticker}: {e}")
-        return None
+    return None
 
 
-def score_ticker(
+def evaluate_ticker(
     api,
     ticker: str,
     min_price: float = 2.0,
@@ -133,23 +103,43 @@ def score_ticker(
     min_rel_vol: float = 5.0,
     max_float: int = 20_000_000,
     min_total_vol: int = 100_000,
-    use_fmp_float: bool = False,
-) -> dict | None:
+    float_shares: int | None = None,
+) -> dict:
+    """Return full five-pillar diagnostics even when the ticker fails."""
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
-    data_client, trading_client = api
+    result = {
+        "ticker": ticker,
+        "price": None,
+        "gap_pct": None,
+        "rel_vol": None,
+        "total_vol": None,
+        "float": float_shares if float_shares is not None else "unknown",
+        "score": 0,
+        "pillars": {
+            "gap": "UNKNOWN",
+            "price": "UNKNOWN",
+            "rel_vol": "UNKNOWN",
+            "volume": "UNKNOWN",
+            "float": "UNKNOWN" if float_shares is None else "FAIL",
+        },
+        "pillar_details": {},
+        "bars": pd.DataFrame(),
+    }
 
+    data_client, _ = api
     bars = get_bars(data_client, ticker, limit=120)
+    result["bars"] = bars
     if bars.empty or len(bars) < 3:
-        return None
+        result["pillar_details"]["data"] = "Insufficient intraday bars"
+        return result
 
-    last_price = bars["Close"].iloc[-1]
-    open_price = bars["Open"].iloc[0]
-    total_vol = bars["Volume"].sum()
+    last_price = float(bars["Close"].iloc[-1])
+    open_price = float(bars["Open"].iloc[0])
+    total_vol = int(bars["Volume"].sum())
     elapsed_min = len(bars)
 
-    # Prior close
     try:
         now = datetime.now(ET)
         request = StockBarsRequest(
@@ -159,16 +149,15 @@ def score_ticker(
             end=now,
             feed="iex",
         )
-        prev_bars = data_client.get_stock_bars(request).df
-        if isinstance(prev_bars.index, pd.MultiIndex):
-            prev_bars = prev_bars.xs(ticker, level="symbol")
-        prior_close = prev_bars["close"].iloc[-2] if len(prev_bars) >= 2 else open_price
+        previous = data_client.get_stock_bars(request).df
+        if isinstance(previous.index, pd.MultiIndex):
+            previous = previous.xs(ticker, level="symbol")
+        prior_close = float(previous["close"].iloc[-2]) if len(previous) >= 2 else open_price
     except Exception:
         prior_close = open_price
 
-    gap_pct = (open_price - prior_close) / prior_close if prior_close else 0
+    gap_pct = ((open_price - prior_close) / prior_close) if prior_close else 0.0
 
-    # Relative volume
     try:
         now = datetime.now(ET)
         request = StockBarsRequest(
@@ -178,55 +167,58 @@ def score_ticker(
             end=now,
             feed="iex",
         )
-        hist = data_client.get_stock_bars(request).df
-        if isinstance(hist.index, pd.MultiIndex):
-            hist = hist.xs(ticker, level="symbol")
-        avg_daily_vol = hist["volume"].mean() if not hist.empty else total_vol
+        history = data_client.get_stock_bars(request).df
+        if isinstance(history.index, pd.MultiIndex):
+            history = history.xs(ticker, level="symbol")
+        average_volume = float(history["volume"].mean()) if not history.empty else float(total_vol)
     except Exception:
-        avg_daily_vol = total_vol
+        average_volume = float(total_vol)
 
-    expected_vol = avg_daily_vol * (elapsed_min / 390)
-    rel_vol = total_vol / expected_vol if expected_vol > 0 else 0
+    expected_volume = average_volume * (elapsed_min / 390)
+    rel_vol = total_vol / expected_volume if expected_volume > 0 else 0.0
 
-    # Float - only call FMP for the final #1 stock
-    if use_fmp_float:
-        float_shares = get_float_fmp(ticker)
-    else:
-        float_shares = None
-
-    # Score pillars
-    pillar_results = {
+    checks = {
         "gap": gap_pct >= min_gap_pct,
         "price": min_price <= last_price <= max_price,
         "rel_vol": rel_vol >= min_rel_vol,
         "volume": total_vol >= min_total_vol,
-        "float": (float_shares <= max_float) if float_shares else None,
+        "float": None if float_shares is None else float_shares <= max_float,
     }
 
-    definitive = {k: v for k, v in pillar_results.items() if v is not None}
-    score = sum(definitive.values())
-    unknowns = len(pillar_results) - len(definitive)
-
-    passes = score >= 4 or (score == 3 and unknowns >= 1)
-    if not passes:
-        return None
-
-    return {
-        "ticker": ticker,
+    result.update({
         "price": round(last_price, 2),
         "gap_pct": round(gap_pct * 100, 1),
         "rel_vol": round(rel_vol, 1),
-        "total_vol": int(total_vol),
-        "float": int(float_shares) if float_shares else "unknown",
-        "score": score,
-        "pillars": {
-            k: ("OK" if v else ("?" if v is None else "FAIL"))
-            for k, v in pillar_results.items()
-        },
-        "bars": bars,
-        "prior_close": prior_close,
+        "total_vol": total_vol,
+        "prior_close": round(prior_close, 4),
+        "float": int(float_shares) if float_shares is not None else "unknown",
+    })
+    result["pillars"] = {
+        key: "UNKNOWN" if value is None else ("PASS" if value else "FAIL")
+        for key, value in checks.items()
     }
+    result["score"] = sum(value is True for value in checks.values())
+    result["pillar_details"] = {
+        "gap": f"{result['gap_pct']}% >= {min_gap_pct * 100:.1f}%",
+        "price": f"${result['price']:.2f} in ${min_price:.2f}-${max_price:.2f}",
+        "rel_vol": f"{result['rel_vol']:.1f}x >= {min_rel_vol:.1f}x",
+        "volume": f"{result['total_vol']:,} >= {min_total_vol:,}",
+        "float": (
+            "unknown until FMP lookup"
+            if float_shares is None
+            else f"{int(float_shares):,} <= {max_float:,}"
+        ),
+    }
+    return result
 
 
-# legacy alias
+def score_ticker(api, ticker: str, **kwargs) -> dict | None:
+    """Compatibility wrapper returning only candidates passing >=4 pillars."""
+    result = evaluate_ticker(api, ticker, **kwargs)
+    known = [value for value in result["pillars"].values() if value != "UNKNOWN"]
+    if result["score"] >= 4 or (result["score"] == 3 and len(known) < 5):
+        return result
+    return None
+
+
 _get_alpaca_client = get_alpaca_client
