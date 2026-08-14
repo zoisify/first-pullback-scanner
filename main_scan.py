@@ -7,10 +7,11 @@ leading gainer stock in the market."
 
 Flow:
 1. screen_market() -> finds stocks gapping up 10%+, $2-$20
-2. score_ticker() -> scores each against 5 pillars
-3. Takes the single highest scoring stock (by score then gap%)
-4. Sends Discord summary
-5. Saves to logs/ for session monitor
+2. score_ticker() -> scores each against 5 pillars (float skipped here)
+3. Takes the single highest scoring stock
+4. Calls FMP float ONLY on that one stock - no rate limit issues
+5. Sends Discord summary
+6. Saves to logs/ for session monitor
 """
 
 from dotenv import load_dotenv
@@ -24,7 +25,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from scanner.auto_screener import screen_market
-from scanner.pillars import _get_alpaca_client, score_ticker
+from scanner.pillars import _get_alpaca_client, score_ticker, get_float_fmp
 from scanner.notify import send_scan_summary, send_no_candidates
 
 ET = ZoneInfo("America/New_York")
@@ -98,7 +99,6 @@ def main():
     print(f"{'='*55}\n")
 
     print("[ Step 1 ] Screening full market for gap/momentum ...\n")
-    # Fetch top 25 raw hits, then pick the #1 after scoring
     raw_hits = screen_market(
         min_price=2.0,
         max_price=20.0,
@@ -115,14 +115,13 @@ def main():
     print(f"\n[ Step 2 ] Scoring {len(raw_hits)} hits against 5 pillars ...\n")
 
     api = _get_alpaca_client()
-
     candidates = []
     all_results = []
 
     for hit in raw_hits:
         ticker = hit["ticker"]
         print(f" {ticker} ...", end=" ", flush=True)
-        result = score_ticker(api, ticker)
+        result = score_ticker(api, ticker, use_fmp_float=False)
         if result:
             loggable = {k: v for k, v in result.items() if k != "bars"}
             all_results.append(loggable)
@@ -137,27 +136,40 @@ def main():
                                 "price": hit["price"]})
             print(f"FAIL failed pillars")
 
-    # Sort by score then gap% - pick the single #1 gapper
+    # Sort and take #1 gapper
     candidates.sort(key=lambda x: (x["score"], x["gap_pct"]), reverse=True)
-    top_candidate = candidates[:1]  # ONLY the #1 stock
+    top_candidate = candidates[:1]
 
-    if top_candidate:
-        c = top_candidate[0]
-        print(f"\n #1 Gapper: {c['ticker']} - {c['gap_pct']}% gap, "
-              f"{c['score']}/5 pillars, rvol={c['rel_vol']}x")
-    else:
+    if not top_candidate:
         print(f"\n No candidates passed >=4 pillars today.")
-
-    save_scan_log(top_candidate, all_results)
-    write_watchlist_csv(top_candidate)
-
-    if top_candidate:
-        send_scan_summary(top_candidate)
-    else:
+        save_scan_log(top_candidate, all_results)
+        write_watchlist_csv(top_candidate)
         send_no_candidates(
             f"Found {len(raw_hits)} gapping stocks but none passed >=4/5 pillars. "
             "No trades today."
         )
+        print("\n Done.")
+        return
+
+    # FMP float lookup on #1 stock only
+    winner = top_candidate[0]
+    print(f"\n[ Step 3 ] Getting float for #1 gapper: {winner['ticker']} ...")
+    float_shares = get_float_fmp(winner["ticker"])
+
+    if float_shares is not None:
+        winner["float"] = int(float_shares)
+        winner["pillars"]["float"] = "OK" if float_shares <= 20_000_000 else "FAIL"
+        print(f" Float confirmed: {int(float_shares):,} shares")
+    else:
+        print(f" Float unknown - proceeding anyway")
+
+    print(f"\n #1 Gapper: {winner['ticker']} - {winner['gap_pct']}% gap, "
+          f"{winner['score']}/5 pillars, rvol={winner['rel_vol']}x "
+          f"float={winner['float']}")
+
+    save_scan_log(top_candidate, all_results)
+    write_watchlist_csv(top_candidate)
+    send_scan_summary(top_candidate)
 
     print("\n Done.")
 
