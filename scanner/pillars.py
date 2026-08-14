@@ -9,7 +9,7 @@ Ross's pillars (from transcript):
 2. Gap / move >= 10% from prior close
 3. Price between $2 and $20
 4. Float <= 20 million shares
-5. Total volume >= 1M (soft)
+5. Total volume >= 100K (lowered from 500K — early pre-market vol is low)
 """
 
 import os
@@ -62,14 +62,12 @@ def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
 
-        # alpaca-py returns a multi-index (symbol, timestamp) — drop symbol level
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(ticker, level="symbol")
 
         df.index = df.index.tz_convert(ET)
         df.columns = [c.capitalize() for c in df.columns]
 
-        # Keep only today's bars
         today = datetime.now(ET).date()
         df = df[df.index.date == today]
 
@@ -81,10 +79,6 @@ def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
 
 
 def get_asset_info(api, ticker: str) -> dict:
-    """
-    Fetch static asset info.
-    api should be the trading_client here.
-    """
     try:
         asset = api.get_asset(ticker)
         return {"tradable": asset.tradable, "fractionable": asset.fractionable}
@@ -100,7 +94,7 @@ def score_ticker(
     min_gap_pct: float = 0.10,
     min_rel_vol: float = 5.0,
     max_float: int = 20_000_000,
-    min_total_vol: int = 500_000,
+    min_total_vol: int = 100_000,  # lowered from 500K — rel vol does the heavy lifting
 ) -> dict | None:
     """
     Score a single ticker against the 5 pillars.
@@ -121,7 +115,7 @@ def score_ticker(
     total_vol = bars["Volume"].sum()
     elapsed_min = len(bars)
 
-    # Prior close: get yesterday's daily bar
+    # Prior close
     try:
         now = datetime.now(ET)
         request = StockBarsRequest(
@@ -201,7 +195,6 @@ def _get_float_yfinance(ticker: str) -> int | None:
     """
     Try to get float shares from yfinance.
     Uses floatShares (actual float) not sharesOutstanding.
-    Returns float share count (int) or None on failure.
     """
     try:
         import yfinance as yf
