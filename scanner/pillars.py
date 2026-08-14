@@ -9,7 +9,7 @@ Ross's pillars (from transcript):
 2. Gap / move >= 10% from prior close
 3. Price between $2 and $20
 4. Float <= 20 million shares
-5. Total volume >= 100K (lowered from 500K — early pre-market vol is low)
+5. Total volume >= 100K (lowered from 500K - early pre-market vol is low)
 """
 
 import os
@@ -94,7 +94,7 @@ def score_ticker(
     min_gap_pct: float = 0.10,
     min_rel_vol: float = 5.0,
     max_float: int = 20_000_000,
-    min_total_vol: int = 100_000,  # lowered from 500K — rel vol does the heavy lifting
+    min_total_vol: int = 100_000,  # lowered from 500K - rel vol does the heavy lifting
 ) -> dict | None:
     """
     Score a single ticker against the 5 pillars.
@@ -183,7 +183,7 @@ def score_ticker(
         "float": int(float_shares) if float_shares else "unknown",
         "score": score,
         "pillars": {
-            k: ("✓" if v else ("?" if v is None else "✗"))
+            k: ("OK" if v else ("?" if v is None else "FAIL"))
             for k, v in pillar_results.items()
         },
         "bars": bars,

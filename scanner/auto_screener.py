@@ -2,13 +2,13 @@
 scanner/auto_screener.py
 
 Automatically scans the full US equity market every morning.
-No static watchlist needed — pulls every active stock from Alpaca,
+No static watchlist needed - pulls every active stock from Alpaca,
 batches snapshot requests, and filters down to momentum candidates.
 
 Filters applied (matching the 5 pillars):
   - Price $2–$20
   - Gap up >= 10% from prior close
-  - Today's volume >= 100K (early morning proxy — grows through session)
+  - Today's volume >= 100K (early morning proxy - grows through session)
   - Excludes ETFs, warrants, rights, preferred shares
 """
 
@@ -33,7 +33,7 @@ def get_all_symbols(min_price: float = 2.0, max_price: float = 20.0) -> list[str
     Filters out ETFs, warrants, rights, preferred shares by name pattern.
     Returns a list of ticker symbols.
     """
-    print("  Fetching full symbol universe from Alpaca …")
+    print("  Fetching full symbol universe from Alpaca ...")
     symbols = []
     url = f"{TRADE_URL}/assets"
     params = {
@@ -71,7 +71,7 @@ def get_all_symbols(min_price: float = 2.0, max_price: float = 20.0) -> list[str
 def get_snapshots_batch(symbols: list[str]) -> dict:
     """
     Fetch Alpaca snapshots for up to 1000 symbols at once.
-    Returns dict of symbol → snapshot data.
+    Returns dict of symbol -> snapshot data.
     """
     url = f"{BASE_URL}/stocks/snapshots"
     params = {
@@ -106,12 +106,12 @@ def screen_market(
     batch_size = 500   # Alpaca allows up to 1000 but 500 is safer
     total_batches = (len(symbols) + batch_size - 1) // batch_size
 
-    print(f"  Scanning {len(symbols)} symbols in {total_batches} batches …")
+    print(f"  Scanning {len(symbols)} symbols in {total_batches} batches ...")
 
     for i in range(0, len(symbols), batch_size):
         batch   = symbols[i:i + batch_size]
         batch_n = (i // batch_size) + 1
-        print(f"  Batch {batch_n}/{total_batches} …", end=" ", flush=True)
+        print(f"  Batch {batch_n}/{total_batches} ...", end=" ", flush=True)
 
         snaps = get_snapshots_batch(batch)
         hits  = 0
@@ -160,6 +160,6 @@ def screen_market(
     candidates.sort(key=lambda x: x["gap_pct"], reverse=True)
     top = candidates[:max_results]
 
-    print(f"\n  Auto-screen complete: {len(candidates)} raw hits → "
+    print(f"\n  Auto-screen complete: {len(candidates)} raw hits -> "
           f"returning top {len(top)}")
     return top

@@ -1,7 +1,7 @@
 """
 main_session.py
 
-Session monitor — Ross Cameron first pullback strategy, 1:1 implementation.
+Session monitor - Ross Cameron first pullback strategy, 1:1 implementation.
 Runs from 7:05 AM ET until 10:00 AM ET hard cutoff.
 Focuses on the single #1 gapper identified by main_scan.py.
 
@@ -93,7 +93,7 @@ def log_signal(row: dict):
 
 def main():
     print(f"\n{'='*55}")
-    print(f" Session Monitor — {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')}")
+    print(f" Session Monitor - {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')}")
     print(f" Hard cutoff: {CUTOFF_H}:00 AM ET")
     print(f" Max daily loss: ${MAX_DAILY_LOSS:,.2f}")
     print(f" Focusing on #1 gapper only")
@@ -104,7 +104,7 @@ def main():
 
     candidates = load_candidates()
     if not candidates:
-        print(" No pre-market candidates — running live scan of watchlist …")
+        print(" No pre-market candidates - running live scan of watchlist ...")
         watchlist = load_watchlist()
         for ticker in watchlist:
             r = score_ticker(api, ticker)
@@ -141,7 +141,7 @@ def main():
         # ── Hard 10:00 AM cutoff ──────────────────────────────────────────────
         if now_et.hour >= CUTOFF_H:
             if not notified_cutoff:
-                print(f"\n 10:00 AM cutoff — Total signals: {total_entries}")
+                print(f"\n 10:00 AM cutoff - Total signals: {total_entries}")
                 send_daily_cutoff(total_entries)
 
             for ticker, pos in list(open_positions.items()):
@@ -290,7 +290,7 @@ def main():
 
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (partial) {ticker} "
-                            f"@${exit_sig.price} — sold {shares_to_sell}, "
+                            f"@${exit_sig.price} - sold {shares_to_sell}, "
                             f"keeping {shares_remaining} runner. P&L: ${pnl:,.2f}"
                         )
                     else:
@@ -306,7 +306,7 @@ def main():
 
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (runner) {ticker} "
-                            f"@${exit_sig.price} — sold {shares_to_sell}. "
+                            f"@${exit_sig.price} - sold {shares_to_sell}. "
                             f"Total P&L: ${pnl:,.2f}"
                         )
 
@@ -382,7 +382,7 @@ def main():
             else:
                 print(f" {now_et.strftime('%H:%M')} {ticker} no signal", flush=True)
 
-        print(f" — sleeping {POLL_SEC}s …", flush=True)
+        print(f" - sleeping {POLL_SEC}s ...", flush=True)
         time.sleep(POLL_SEC)
 
     print(" Session monitor complete.")
