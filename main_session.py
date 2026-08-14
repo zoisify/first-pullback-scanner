@@ -8,6 +8,8 @@ Focuses on the single #1 gapper identified by main_scan.py.
 Strategy:
 - Risk 1% of account on initial entry
 - Scale in once (0.5% risk) on new high crossing candle
+- Re-entry after stop out - watches for second pullback setup
+- Anticipation entry: enter on break of prior high, not after close
 - Stop at pullback low (separate stop order, updated on scale-in)
 - Trailing stop on runner after first partial exit
 - Exit 60% on first indicator, hold 40% runner
@@ -25,7 +27,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from scanner.pillars import _get_alpaca_client, get_bars, score_ticker
-from scanner.signals import detect_entry, detect_exit, detect_scalein, calc_trailing_stop, Signal
+from scanner.signals import (
+    detect_entry, detect_exit, detect_scalein,
+    detect_reentry, calc_trailing_stop, Signal,
+)
 from scanner.notify import (
     send_entry_signal, send_exit_signal,
     send_daily_cutoff, send_no_candidates,
@@ -42,13 +47,14 @@ LOG_DIR = "logs"
 POLL_SEC = 60
 CUTOFF_H = 10
 
-RISK_PCT = 0.01          # 1% risk on initial entry
-SCALEIN_RISK_PCT = 0.005 # 0.5% risk on scale-in
+RISK_PCT = 0.01
+SCALEIN_RISK_PCT = 0.005
 ACCOUNT_EQUITY = 100_000.0
 MAX_DAILY_LOSS = 2_000.0
 FIRST_EXIT_SELL_FRAC = 0.6
-PNL_UPDATE_INTERVAL = 30  # minutes
+PNL_UPDATE_INTERVAL = 30
 TRAIL_MULTIPLIER = 1.0
+MAX_ENTRIES_PER_TICKER = 2  # initial + 1 re-entry after stop
 
 
 def load_candidates() -> list[dict]:
@@ -115,7 +121,6 @@ def main():
         send_no_candidates("No candidates found. Nothing to monitor.")
         return
 
-    # Sort and take only the #1 gapper
     candidates.sort(key=lambda x: (x.get("score", 0), x.get("gap_pct", 0)), reverse=True)
     candidates = candidates[:1]
 
@@ -124,9 +129,9 @@ def main():
 
     print(f" #1 Gapper: {watchlist[0]}\n")
 
-    # Position state
     open_positions: dict[str, dict] = {}
-    fired_entries: set[str] = set()
+    entry_counts: dict[str, int] = {}
+    stop_out_prices: dict[str, float] = {}
     total_entries: int = 0
     notified_cutoff: bool = False
 
@@ -138,7 +143,7 @@ def main():
     while True:
         now_et = datetime.now(ET)
 
-        # ── Hard 10:00 AM cutoff ──────────────────────────────────────────────
+        # Hard 10:00 AM cutoff
         if now_et.hour >= CUTOFF_H:
             if not notified_cutoff:
                 print(f"\n 10:00 AM cutoff - Total signals: {total_entries}")
@@ -150,7 +155,8 @@ def main():
                 pnl = (exit_price - pos["entry_price"]) * pos["shares_remaining"]
                 daily_pnl += pnl
 
-                exit_sig = Signal(type="EXIT", ticker=ticker, price=exit_price, reason="hard_cutoff")
+                exit_sig = Signal(type="EXIT", ticker=ticker,
+                                  price=exit_price, reason="hard_cutoff")
                 submit_exit_order(exit_sig, current_qty=pos["shares_remaining"],
                                   stop_order_id=pos.get("stop_order_id"))
                 send_exit_signal(exit_sig, pos["entry_price"], pnl)
@@ -169,13 +175,13 @@ def main():
             send_pnl_update(daily_pnl, peak_daily_pnl, total_entries, final=True)
             break
 
-        # ── 30-min P&L update ─────────────────────────────────────────────────
+        # 30-min P&L update
         mins_since_update = (now_et - last_pnl_update).seconds / 60
         if mins_since_update >= PNL_UPDATE_INTERVAL:
             send_pnl_update(daily_pnl, peak_daily_pnl, total_entries, final=False)
             last_pnl_update = now_et
 
-        # ── Daily walk-away ───────────────────────────────────────────────────
+        # Walk-away check
         if not stopped_for_day:
             if peak_daily_pnl > 0 and daily_pnl <= 0.5 * peak_daily_pnl:
                 print("\n Walk-away: given back >= 50% of peak P&L. No new entries.")
@@ -184,7 +190,7 @@ def main():
                 print("\n Walk-away: max daily loss hit. No new entries.")
                 stopped_for_day = True
 
-        # ── Poll the #1 gapper ────────────────────────────────────────────────
+        # Poll the #1 gapper
         for ticker in watchlist:
             bars = get_bars(data_client, ticker, limit=60)
             if bars.empty:
@@ -192,7 +198,7 @@ def main():
 
             meta = candidate_map.get(ticker, {})
 
-            # ── Manage open position ─────────────────────────────────────────
+            # Manage open position
             if ticker in open_positions:
                 pos = open_positions[ticker]
 
@@ -259,7 +265,6 @@ def main():
                     peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
 
                     if pos["exits_fired"] == 0:
-                        # First exit: sell 60% core, keep 40% runner
                         shares_to_sell = int(pos["shares_total"] * FIRST_EXIT_SELL_FRAC)
                         shares_remaining = pos["shares_total"] - shares_to_sell
                         partial = True
@@ -272,7 +277,6 @@ def main():
                                           stop_order_id=pos.get("stop_order_id"))
                         pos["stop_order_id"] = None
 
-                        # Resubmit stop for runner
                         if shares_remaining > 0:
                             from alpaca.trading.requests import StopOrderRequest
                             from alpaca.trading.enums import OrderSide, TimeInForce
@@ -294,7 +298,6 @@ def main():
                             f"keeping {shares_remaining} runner. P&L: ${pnl:,.2f}"
                         )
                     else:
-                        # Second exit: sell runner
                         shares_to_sell = pos["shares_remaining"]
                         shares_remaining = 0
                         partial = False
@@ -307,8 +310,13 @@ def main():
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (runner) {ticker} "
                             f"@${exit_sig.price} - sold {shares_to_sell}. "
-                            f"Total P&L: ${pnl:,.2f}"
+                            f"P&L: ${pnl:,.2f}"
                         )
+
+                    # Record stop price for re-entry detection
+                    if exit_sig.reason == "stop_loss":
+                        stop_out_prices[ticker] = exit_sig.price
+                        print(f" Stop out at ${exit_sig.price} - watching for re-entry setup")
 
                     send_exit_signal(exit_sig, pos["entry_price"], pnl)
                     log_signal({
@@ -326,17 +334,30 @@ def main():
 
                 continue
 
-            # ── Entry check ──────────────────────────────────────────────────
-            if ticker in fired_entries or stopped_for_day:
+            # Entry / Re-entry check
+            if stopped_for_day:
+                continue
+
+            entries_so_far = entry_counts.get(ticker, 0)
+            if entries_so_far >= MAX_ENTRIES_PER_TICKER:
                 continue
 
             live_candidate = dict(meta)
             live_candidate["bars"] = bars
 
-            entry_sig = detect_entry(live_candidate)
+            if entries_so_far == 0:
+                entry_sig = detect_entry(live_candidate)
+            elif entries_so_far == 1 and ticker in stop_out_prices:
+                entry_sig = detect_reentry(
+                    live_candidate,
+                    stop_out_price=stop_out_prices[ticker],
+                )
+            else:
+                continue
+
             if entry_sig:
                 total_entries += 1
-                fired_entries.add(ticker)
+                entry_counts[ticker] = entries_so_far + 1
 
                 order_result = submit_entry_order(
                     entry_sig, account_size=ACCOUNT_EQUITY, risk_pct=RISK_PCT,
@@ -363,24 +384,28 @@ def main():
                     "stop_order_id": order_result["stop_order_id"] if order_result else None,
                 }
 
+                entry_type = "RE-ENTRY" if entries_so_far == 1 else "ENTRY"
                 print(
-                    f" {now_et.strftime('%H:%M')} ENTRY {ticker} @${entry_sig.price}"
-                    f" stop=${entry_sig.stop} 2R=${entry_sig.target_2r}"
-                    f" shares={shares_total} risk=${dollar_risk:,.2f}"
+                    f" {now_et.strftime('%H:%M')} {entry_type} {ticker} "
+                    f"@${entry_sig.price} stop=${entry_sig.stop} "
+                    f"2R=${entry_sig.target_2r} shares={shares_total} "
+                    f"risk=${dollar_risk:,.2f}"
                 )
                 send_entry_signal(entry_sig)
                 log_signal({
                     "timestamp": now_et.isoformat(), "ticker": ticker,
-                    "action": "ENTRY", "price": entry_sig.price,
+                    "action": entry_type, "price": entry_sig.price,
                     "stop": entry_sig.stop, "target_2r": entry_sig.target_2r,
-                    "risk_per_share": entry_sig.risk_per_share, "reason": entry_sig.reason,
-                    "score": entry_sig.score, "gap_pct": entry_sig.gap_pct,
-                    "rel_vol": entry_sig.rel_vol, "total_vol": entry_sig.total_vol,
-                    "shares": shares_total, "partial": False,
-                    "daily_pnl": daily_pnl, "peak_daily_pnl": peak_daily_pnl,
+                    "risk_per_share": entry_sig.risk_per_share,
+                    "reason": entry_sig.reason, "score": entry_sig.score,
+                    "gap_pct": entry_sig.gap_pct, "rel_vol": entry_sig.rel_vol,
+                    "total_vol": entry_sig.total_vol, "shares": shares_total,
+                    "partial": False, "daily_pnl": daily_pnl,
+                    "peak_daily_pnl": peak_daily_pnl,
                 })
             else:
-                print(f" {now_et.strftime('%H:%M')} {ticker} no signal", flush=True)
+                label = "watching for re-entry" if entries_so_far == 1 else "no signal"
+                print(f" {now_et.strftime('%H:%M')} {ticker} {label}", flush=True)
 
         print(f" - sleeping {POLL_SEC}s ...", flush=True)
         time.sleep(POLL_SEC)
