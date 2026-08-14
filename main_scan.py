@@ -1,4 +1,4 @@
-"""Pre-market scan with five-pillar Discord diagnostics for every raw gapper."""
+"""Pre-market scan using current-day session boundaries."""
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -6,8 +6,8 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 import csv
 import json
-import numpy as np
 import os
+import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -32,13 +32,13 @@ def save_scan_log(candidates, all_results):
     os.makedirs(LOG_DIR, exist_ok=True)
     date_str = datetime.now(ET).strftime("%Y%m%d")
     path = os.path.join(LOG_DIR, f"scan_{date_str}.csv")
-    fields = ["ticker", "score", "price", "gap_pct", "rel_vol", "total_vol", "float", "gap", "price_pillar", "rel_vol_pillar", "volume_pillar", "float_pillar"]
+    fields = ["ticker", "score", "price", "gap_pct", "rel_vol", "total_vol", "float", "gap", "price_pillar", "rel_vol_pillar", "volume_pillar", "float_pillar", "latest_trade_at", "premarket_start", "reference_session"]
     with open(path, "w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         for item in all_results:
             writer.writerow({
-                "ticker": item.get("ticker", ""), "score": item.get("score", 0), "price": item.get("price", ""), "gap_pct": item.get("gap_pct", ""), "rel_vol": item.get("rel_vol", ""), "total_vol": item.get("total_vol", ""), "float": item.get("float", ""), "gap": item.get("pillars", {}).get("gap", ""), "price_pillar": item.get("pillars", {}).get("price", ""), "rel_vol_pillar": item.get("pillars", {}).get("rel_vol", ""), "volume_pillar": item.get("pillars", {}).get("volume", ""), "float_pillar": item.get("pillars", {}).get("float", ""),
+                "ticker": item.get("ticker", ""), "score": item.get("score", 0), "price": item.get("price", ""), "gap_pct": item.get("gap_pct", ""), "rel_vol": item.get("rel_vol", ""), "total_vol": item.get("total_vol", ""), "float": item.get("float", ""), "gap": item.get("pillars", {}).get("gap", ""), "price_pillar": item.get("pillars", {}).get("price", ""), "rel_vol_pillar": item.get("pillars", {}).get("rel_vol", ""), "volume_pillar": item.get("pillars", {}).get("volume", ""), "float_pillar": item.get("pillars", {}).get("float", ""), "latest_trade_at": item.get("session", {}).get("latest_trade_at", ""), "premarket_start": item.get("session", {}).get("premarket_start", ""), "reference_session": item.get("session", {}).get("reference_session", ""),
             })
     json_path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
     with open(json_path, "w") as file: json.dump([_clean(item) for item in candidates], file, indent=2, cls=_Encoder)
