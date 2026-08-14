@@ -1,4 +1,4 @@
-"""Pre-market-only gap scanner with explicit ET session boundaries."""
+﻿"""Pre-market-only gap scanner with explicit ET session boundaries."""
 
 import os
 import time
@@ -139,3 +139,4 @@ def screen_market(min_price=2.0, max_price=20.0, min_gap_pct=0.10, min_volume=10
     candidates.sort(key=lambda item: item["gap_pct"], reverse=True)
     print(f"\n Auto-screen complete: {len(candidates)} raw hits -> returning top {min(len(candidates), max_results)}")
     return candidates[:max_results]
+
