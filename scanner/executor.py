@@ -2,24 +2,19 @@
 scanner/executor.py
 
 Order execution layer for Alpaca paper trading.
-Uses the modern alpaca-py SDK with typed request objects.
+Ross Cameron first pullback strategy — 1:1 implementation.
 
-Strategy (Ross Cameron first pullback):
-- Entry: plain market buy + bid/ask spread check
-- Stop: separate stop order at pullback low
-- NO bracket / NO hard 2R exit — let indicators handle exits
-- Exit partial (60%) on first indicator via market sell
-- Exit runner (40%) on second indicator or 10 AM cutoff
-- Trailing stop: updated every poll on runner position
+- Entry: market buy + bid/ask spread check + separate stop order
+- Scale-in: additional market buy on new high with updated stop
+- Exit partial: sell 60% core on first indicator
+- Exit runner: sell remaining 40% on second indicator or cutoff
+- Trailing stop: updated every poll on runner
 """
 
 import os
 from typing import Optional
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    StopOrderRequest,
-)
+from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 
@@ -33,9 +28,9 @@ def get_trading_client() -> TradingClient:
 
 def check_spread(ticker: str, max_spread_pct: float = 0.02) -> bool:
     """
-    Check bid/ask spread is tight enough to enter.
-    Returns True if spread is acceptable, False if too wide.
-    Max spread default: 2% of mid price.
+    Check bid/ask spread before entering.
+    Returns True if tight enough, False if too wide.
+    Proxy for Ross's Level 2 sentiment check.
     """
     try:
         from alpaca.data.historical import StockHistoricalDataClient
@@ -58,6 +53,7 @@ def check_spread(ticker: str, max_spread_pct: float = 0.02) -> bool:
             print(f" [{ticker}] Spread too wide: {spread_pct:.1%} (bid={bid}, ask={ask})")
             return False
 
+        print(f" [{ticker}] Spread OK: {spread_pct:.1%} (bid={bid}, ask={ask})")
         return True
 
     except Exception as e:
@@ -71,13 +67,10 @@ def submit_entry_order(
     risk_pct: float = 0.01,
 ) -> Optional[dict]:
     """
-    Checks spread, then submits a market buy + separate stop loss order.
-    No bracket / no 2R hard exit — exits handled by indicator detection.
-
-    Returns dict with order_id, stop_order_id, shares on success, else None.
+    Spread check → market buy → separate stop order.
+    Returns dict with order_id, stop_order_id, shares on success.
     """
     try:
-        # Spread check before entering
         if not check_spread(signal.ticker):
             return None
 
@@ -93,7 +86,6 @@ def submit_entry_order(
             print(f" [{signal.ticker}] Position size too small")
             return None
 
-        # 1. Market buy
         buy_order = MarketOrderRequest(
             symbol=signal.ticker,
             qty=shares,
@@ -104,7 +96,6 @@ def submit_entry_order(
         print(f" BUY ORDER: {buy_resp.id} — {shares}x {signal.ticker}")
         print(f"   Entry ~${signal.price} | Stop ${signal.stop} | 2R ref ${signal.target_2r}")
 
-        # 2. Separate stop loss order
         stop_order = StopOrderRequest(
             symbol=signal.ticker,
             qty=shares,
@@ -127,15 +118,82 @@ def submit_entry_order(
         return None
 
 
+def submit_scalein_order(
+    signal,
+    account_size: float = 65_000,
+    risk_pct: float = 0.005,  # half size on scale-in (0.5% risk)
+    old_stop_order_id: Optional[str] = None,
+    total_shares_held: int = 0,
+) -> Optional[dict]:
+    """
+    Scale-in: additional buy on new high.
+    Cancels old stop, buys more shares, submits new stop covering all shares.
+    Uses half the normal risk (0.5%) so total risk stays controlled.
+    Returns dict with order_id, stop_order_id, shares added.
+    """
+    try:
+        if not check_spread(signal.ticker):
+            return None
+
+        client = get_trading_client()
+
+        risk_per_share = signal.price - signal.stop
+        if risk_per_share <= 0:
+            return None
+
+        shares_to_add = int((account_size * risk_pct) / risk_per_share)
+        if shares_to_add <= 0:
+            print(f" [{signal.ticker}] Scale-in size too small")
+            return None
+
+        # Cancel old stop before adding shares
+        if old_stop_order_id:
+            try:
+                client.cancel_order_by_id(old_stop_order_id)
+                print(f" Cancelled old stop for scale-in: {old_stop_order_id}")
+            except Exception:
+                pass
+
+        # Buy additional shares
+        buy_order = MarketOrderRequest(
+            symbol=signal.ticker,
+            qty=shares_to_add,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        )
+        buy_resp = client.submit_order(order_data=buy_order)
+        print(f" SCALE-IN ORDER: {buy_resp.id} — +{shares_to_add}x {signal.ticker} @~${signal.price}")
+
+        # New stop covers ALL shares (original + added)
+        total_shares = total_shares_held + shares_to_add
+        stop_order = StopOrderRequest(
+            symbol=signal.ticker,
+            qty=total_shares,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=round(signal.stop, 2),
+        )
+        stop_resp = client.submit_order(order_data=stop_order)
+        print(f" NEW STOP ORDER: {stop_resp.id} — {total_shares} shares @ ${signal.stop}")
+
+        return {
+            "order_id": buy_resp.id,
+            "stop_order_id": stop_resp.id,
+            "shares_added": shares_to_add,
+            "symbol": signal.ticker,
+        }
+
+    except Exception as e:
+        print(f" [ERROR] Scale-in failed for {signal.ticker}: {e}")
+        return None
+
+
 def submit_exit_order(
     signal,
     current_qty: int,
     stop_order_id: Optional[str] = None,
 ) -> Optional[dict]:
-    """
-    Submits a market sell for current_qty shares.
-    Cancels the stop order first to avoid double-sell.
-    """
+    """Market sell for current_qty shares. Cancels stop first to avoid double-fill."""
     try:
         client = get_trading_client()
 
@@ -143,13 +201,12 @@ def submit_exit_order(
             print(f" [{signal.ticker}] No shares to sell (qty={current_qty})")
             return None
 
-        # Cancel existing stop order to avoid double-fill
         if stop_order_id:
             try:
                 client.cancel_order_by_id(stop_order_id)
                 print(f" Cancelled stop order {stop_order_id}")
             except Exception:
-                pass  # may already be filled or cancelled
+                pass
 
         order = MarketOrderRequest(
             symbol=signal.ticker,
@@ -172,22 +229,16 @@ def update_trailing_stop(
     old_stop_order_id: Optional[str],
     new_stop_price: float,
 ) -> Optional[str]:
-    """
-    Cancels the old stop order and submits a new one at new_stop_price.
-    Used to trail the stop up as price moves in our favour.
-    Returns new stop_order_id on success, None on failure.
-    """
+    """Cancel old stop, submit new one at higher price. Returns new stop_order_id."""
     try:
         client = get_trading_client()
 
-        # Cancel old stop
         if old_stop_order_id:
             try:
                 client.cancel_order_by_id(old_stop_order_id)
             except Exception:
                 pass
 
-        # Submit new stop at higher price
         stop_order = StopOrderRequest(
             symbol=ticker,
             qty=current_qty,
@@ -205,7 +256,6 @@ def update_trailing_stop(
 
 
 def get_current_position_qty(ticker: str) -> int:
-    """Query Alpaca for current position size. Returns 0 if no position."""
     try:
         client = get_trading_client()
         position = client.get_open_position(ticker)

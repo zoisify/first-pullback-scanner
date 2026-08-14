@@ -1,21 +1,20 @@
 """
 main_session.py
 
-Session monitor — called by trading.yml at 7:05 AM ET.
-Runs until 10:00 AM ET hard cutoff.
-Polls every 60 seconds for first-pullback entry/exit signals.
+Session monitor — Ross Cameron first pullback strategy, 1:1 implementation.
+Runs from 7:05 AM ET until 10:00 AM ET hard cutoff.
+Focuses on the single #1 gapper identified by main_scan.py.
 
-Ross-style strategy:
-- Risk 1% of account per trade
-- Stop: pullback low (separate stop order)
-- NO hard 2R exit — exit on indicators only
-- Partial sell 60% on first indicator, hold 40% runner
+Strategy:
+- Risk 1% of account on initial entry
+- Scale in once (0.5% risk) on new high crossing candle
+- Stop at pullback low (separate stop order, updated on scale-in)
 - Trailing stop on runner after first partial exit
+- Exit 60% on first indicator, hold 40% runner
 - Walk-away if give back 50% of peak P&L or hit max daily loss
-- Focus on strongest gapper (sorted by score + gap)
-- 30-min P&L update to Discord
-- Bid/ask spread check before entry
-- Time weighting: stricter after 9:30 AM ET
+- Bid/ask spread check before every entry
+- Stricter entries after 9:30 AM ET
+- 30-min P&L Discord updates
 """
 
 import os
@@ -26,7 +25,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from scanner.pillars import _get_alpaca_client, get_bars, score_ticker
-from scanner.signals import detect_entry, detect_exit, calc_trailing_stop, Signal
+from scanner.signals import detect_entry, detect_exit, detect_scalein, calc_trailing_stop, Signal
 from scanner.notify import (
     send_entry_signal, send_exit_signal,
     send_daily_cutoff, send_no_candidates,
@@ -34,7 +33,8 @@ from scanner.notify import (
 )
 from scanner.executor import (
     submit_entry_order, submit_exit_order,
-    update_trailing_stop, get_trading_client,
+    submit_scalein_order, update_trailing_stop,
+    get_trading_client,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -42,13 +42,12 @@ LOG_DIR = "logs"
 POLL_SEC = 60
 CUTOFF_H = 10
 
-RISK_PCT = 0.01
+RISK_PCT = 0.01          # 1% risk on initial entry
+SCALEIN_RISK_PCT = 0.005 # 0.5% risk on scale-in
 ACCOUNT_EQUITY = 65_000.0
 MAX_DAILY_LOSS = 2_000.0
 FIRST_EXIT_SELL_FRAC = 0.6
-PNL_UPDATE_INTERVAL = 30  # minutes between Discord P&L updates
-
-# Trailing stop: trail 1R below highest close since entry
+PNL_UPDATE_INTERVAL = 30  # minutes
 TRAIL_MULTIPLIER = 1.0
 
 
@@ -97,6 +96,7 @@ def main():
     print(f" Session Monitor — {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')}")
     print(f" Hard cutoff: {CUTOFF_H}:00 AM ET")
     print(f" Max daily loss: ${MAX_DAILY_LOSS:,.2f}")
+    print(f" Focusing on #1 gapper only")
     print(f"{'='*55}\n")
 
     api = _get_alpaca_client()
@@ -112,17 +112,19 @@ def main():
                 candidates.append({k: v for k, v in r.items() if k != "bars"})
 
     if not candidates:
-        send_no_candidates("No candidates and watchlist empty. Nothing to monitor.")
+        send_no_candidates("No candidates found. Nothing to monitor.")
         return
 
-    # Sort by score desc then gap desc — focus on strongest gapper first
+    # Sort and take only the #1 gapper
     candidates.sort(key=lambda x: (x.get("score", 0), x.get("gap_pct", 0)), reverse=True)
+    candidates = candidates[:1]
 
     candidate_map = {c["ticker"]: c for c in candidates}
     watchlist = [c["ticker"] for c in candidates]
 
-    print(f" Monitoring {len(watchlist)} candidates (strongest first): {', '.join(watchlist)}\n")
+    print(f" #1 Gapper: {watchlist[0]}\n")
 
+    # Position state
     open_positions: dict[str, dict] = {}
     fired_entries: set[str] = set()
     total_entries: int = 0
@@ -131,7 +133,6 @@ def main():
     daily_pnl: float = 0.0
     peak_daily_pnl: float = 0.0
     stopped_for_day: bool = False
-
     last_pnl_update: datetime = datetime.now(ET)
 
     while True:
@@ -149,35 +150,18 @@ def main():
                 pnl = (exit_price - pos["entry_price"]) * pos["shares_remaining"]
                 daily_pnl += pnl
 
-                exit_sig = Signal(
-                    type="EXIT",
-                    ticker=ticker,
-                    price=exit_price,
-                    reason="hard_cutoff",
-                )
-                submit_exit_order(
-                    exit_sig,
-                    current_qty=pos["shares_remaining"],
-                    stop_order_id=pos.get("stop_order_id"),
-                )
+                exit_sig = Signal(type="EXIT", ticker=ticker, price=exit_price, reason="hard_cutoff")
+                submit_exit_order(exit_sig, current_qty=pos["shares_remaining"],
+                                  stop_order_id=pos.get("stop_order_id"))
                 send_exit_signal(exit_sig, pos["entry_price"], pnl)
                 log_signal({
-                    "timestamp": now_et.isoformat(),
-                    "ticker": ticker,
-                    "action": "EXIT",
-                    "price": exit_price,
-                    "reason": "hard_cutoff",
+                    "timestamp": now_et.isoformat(), "ticker": ticker,
+                    "action": "EXIT", "price": exit_price, "reason": "hard_cutoff",
                     "risk_per_share": pnl / pos["shares_total"] if pos["shares_total"] else 0,
-                    "shares": pos["shares_remaining"],
-                    "partial": False,
-                    "daily_pnl": daily_pnl,
-                    "peak_daily_pnl": peak_daily_pnl,
-                    "stop": pos["stop"],
-                    "target_2r": pos["target_2r"],
-                    "score": "",
-                    "gap_pct": "",
-                    "rel_vol": "",
-                    "total_vol": "",
+                    "shares": pos["shares_remaining"], "partial": False,
+                    "daily_pnl": daily_pnl, "peak_daily_pnl": peak_daily_pnl,
+                    "stop": pos["stop"], "target_2r": pos["target_2r"],
+                    "score": "", "gap_pct": "", "rel_vol": "", "total_vol": "",
                 })
                 del open_positions[ticker]
 
@@ -185,13 +169,13 @@ def main():
             send_pnl_update(daily_pnl, peak_daily_pnl, total_entries, final=True)
             break
 
-        # ── 30-min P&L Discord update ─────────────────────────────────────────
+        # ── 30-min P&L update ─────────────────────────────────────────────────
         mins_since_update = (now_et - last_pnl_update).seconds / 60
         if mins_since_update >= PNL_UPDATE_INTERVAL:
             send_pnl_update(daily_pnl, peak_daily_pnl, total_entries, final=False)
             last_pnl_update = now_et
 
-        # ── Daily walk-away check ─────────────────────────────────────────────
+        # ── Daily walk-away ───────────────────────────────────────────────────
         if not stopped_for_day:
             if peak_daily_pnl > 0 and daily_pnl <= 0.5 * peak_daily_pnl:
                 print("\n Walk-away: given back >= 50% of peak P&L. No new entries.")
@@ -200,7 +184,7 @@ def main():
                 print("\n Walk-away: max daily loss hit. No new entries.")
                 stopped_for_day = True
 
-        # ── Poll each candidate ───────────────────────────────────────────────
+        # ── Poll the #1 gapper ────────────────────────────────────────────────
         for ticker in watchlist:
             bars = get_bars(data_client, ticker, limit=60)
             if bars.empty:
@@ -208,32 +192,65 @@ def main():
 
             meta = candidate_map.get(ticker, {})
 
-            # ── Trailing stop update (runner only, after first partial exit) ──
+            # ── Manage open position ─────────────────────────────────────────
             if ticker in open_positions:
                 pos = open_positions[ticker]
 
+                # Trailing stop update (runner only)
                 if pos["exits_fired"] >= 1 and pos["shares_remaining"] > 0:
-                    # Calculate new trailing stop
                     bars_since_entry = bars[bars.index >= pos.get("entry_time", bars.index[0])]
                     new_trail = calc_trailing_stop(
-                        bars_since_entry,
-                        pos["entry_price"],
-                        pos["original_risk"],
-                        TRAIL_MULTIPLIER,
+                        bars_since_entry, pos["entry_price"],
+                        pos["original_risk"], TRAIL_MULTIPLIER,
                     )
-
-                    # Only update if trail has moved up
                     if new_trail > pos["stop"]:
                         new_stop_id = update_trailing_stop(
-                            ticker,
-                            pos["shares_remaining"],
-                            pos.get("stop_order_id"),
-                            new_trail,
+                            ticker, pos["shares_remaining"],
+                            pos.get("stop_order_id"), new_trail,
                         )
                         pos["stop"] = new_trail
                         pos["stop_order_id"] = new_stop_id
 
-                # ── Exit check ───────────────────────────────────────────────
+                # Scale-in check (before first exit, only once)
+                if (pos["exits_fired"] == 0
+                        and not pos.get("scaled_in", False)
+                        and not stopped_for_day):
+                    scalein_sig = detect_scalein(
+                        bars, ticker, pos["entry_price"],
+                        pos["original_risk"], pos.get("scaled_in", False),
+                    )
+                    if scalein_sig:
+                        scalein_result = submit_scalein_order(
+                            scalein_sig,
+                            account_size=ACCOUNT_EQUITY,
+                            risk_pct=SCALEIN_RISK_PCT,
+                            old_stop_order_id=pos.get("stop_order_id"),
+                            total_shares_held=pos["shares_remaining"],
+                        )
+                        if scalein_result:
+                            shares_added = scalein_result["shares_added"]
+                            pos["shares_total"] += shares_added
+                            pos["shares_remaining"] += shares_added
+                            pos["stop"] = scalein_sig.stop
+                            pos["stop_order_id"] = scalein_result["stop_order_id"]
+                            pos["scaled_in"] = True
+                            print(
+                                f" {now_et.strftime('%H:%M')} SCALE-IN {ticker} "
+                                f"+{shares_added} shares @~${scalein_sig.price} "
+                                f"new stop=${scalein_sig.stop}"
+                            )
+                            log_signal({
+                                "timestamp": now_et.isoformat(), "ticker": ticker,
+                                "action": "SCALEIN", "price": scalein_sig.price,
+                                "stop": scalein_sig.stop, "target_2r": "",
+                                "risk_per_share": scalein_sig.risk_per_share,
+                                "reason": scalein_sig.reason, "score": "",
+                                "gap_pct": "", "rel_vol": "", "total_vol": "",
+                                "shares": shares_added, "partial": False,
+                                "daily_pnl": daily_pnl, "peak_daily_pnl": peak_daily_pnl,
+                            })
+
+                # Exit check
                 exit_sig = detect_exit(bars, pos["entry_price"], pos["stop"], ticker)
 
                 if exit_sig and pos["shares_remaining"] > 0:
@@ -242,7 +259,7 @@ def main():
                     peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
 
                     if pos["exits_fired"] == 0:
-                        # First exit: sell core (60%), keep runner (40%)
+                        # First exit: sell 60% core, keep 40% runner
                         shares_to_sell = int(pos["shares_total"] * FIRST_EXIT_SELL_FRAC)
                         shares_remaining = pos["shares_total"] - shares_to_sell
                         partial = True
@@ -251,11 +268,8 @@ def main():
                         pos["shares_remaining"] = shares_remaining
                         pos["entry_pnl_at_first_exit"] = pnl
 
-                        submit_exit_order(
-                            exit_sig,
-                            current_qty=shares_to_sell,
-                            stop_order_id=pos.get("stop_order_id"),
-                        )
+                        submit_exit_order(exit_sig, current_qty=shares_to_sell,
+                                          stop_order_id=pos.get("stop_order_id"))
                         pos["stop_order_id"] = None
 
                         # Resubmit stop for runner
@@ -264,14 +278,11 @@ def main():
                             from alpaca.trading.enums import OrderSide, TimeInForce
                             try:
                                 tc = get_trading_client()
-                                runner_stop = StopOrderRequest(
-                                    symbol=ticker,
-                                    qty=shares_remaining,
-                                    side=OrderSide.SELL,
-                                    time_in_force=TimeInForce.DAY,
+                                r = tc.submit_order(order_data=StopOrderRequest(
+                                    symbol=ticker, qty=shares_remaining,
+                                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
                                     stop_price=round(pos["stop"], 2),
-                                )
-                                r = tc.submit_order(order_data=runner_stop)
+                                ))
                                 pos["stop_order_id"] = r.id
                                 print(f" Runner stop: {r.id} ({shares_remaining} shares @ ${pos['stop']})")
                             except Exception as e:
@@ -282,7 +293,6 @@ def main():
                             f"@${exit_sig.price} — sold {shares_to_sell}, "
                             f"keeping {shares_remaining} runner. P&L: ${pnl:,.2f}"
                         )
-
                     else:
                         # Second exit: sell runner
                         shares_to_sell = pos["shares_remaining"]
@@ -291,11 +301,8 @@ def main():
                         reason = f"{exit_sig.reason}_full_runner"
                         pos["shares_remaining"] = 0
 
-                        submit_exit_order(
-                            exit_sig,
-                            current_qty=shares_to_sell,
-                            stop_order_id=pos.get("stop_order_id"),
-                        )
+                        submit_exit_order(exit_sig, current_qty=shares_to_sell,
+                                          stop_order_id=pos.get("stop_order_id"))
 
                         print(
                             f" {now_et.strftime('%H:%M')} EXIT (runner) {ticker} "
@@ -305,22 +312,13 @@ def main():
 
                     send_exit_signal(exit_sig, pos["entry_price"], pnl)
                     log_signal({
-                        "timestamp": now_et.isoformat(),
-                        "ticker": ticker,
-                        "action": "EXIT",
-                        "price": exit_sig.price,
-                        "reason": reason,
+                        "timestamp": now_et.isoformat(), "ticker": ticker,
+                        "action": "EXIT", "price": exit_sig.price, "reason": reason,
                         "risk_per_share": pnl / pos["shares_total"] if pos["shares_total"] else 0,
-                        "shares": shares_to_sell,
-                        "partial": partial,
-                        "daily_pnl": daily_pnl,
-                        "peak_daily_pnl": peak_daily_pnl,
-                        "stop": pos["stop"],
-                        "target_2r": pos["target_2r"],
-                        "score": "",
-                        "gap_pct": "",
-                        "rel_vol": "",
-                        "total_vol": "",
+                        "shares": shares_to_sell, "partial": partial,
+                        "daily_pnl": daily_pnl, "peak_daily_pnl": peak_daily_pnl,
+                        "stop": pos["stop"], "target_2r": pos["target_2r"],
+                        "score": "", "gap_pct": "", "rel_vol": "", "total_vol": "",
                     })
 
                     if shares_remaining == 0:
@@ -329,10 +327,7 @@ def main():
                 continue
 
             # ── Entry check ──────────────────────────────────────────────────
-            if ticker in fired_entries:
-                continue
-
-            if stopped_for_day:
+            if ticker in fired_entries or stopped_for_day:
                 continue
 
             live_candidate = dict(meta)
@@ -344,9 +339,7 @@ def main():
                 fired_entries.add(ticker)
 
                 order_result = submit_entry_order(
-                    entry_sig,
-                    account_size=ACCOUNT_EQUITY,
-                    risk_pct=RISK_PCT,
+                    entry_sig, account_size=ACCOUNT_EQUITY, risk_pct=RISK_PCT,
                 )
 
                 risk_per_share = entry_sig.risk_per_share
@@ -364,6 +357,7 @@ def main():
                     "shares_total": shares_total,
                     "shares_remaining": shares_total,
                     "exits_fired": 0,
+                    "scaled_in": False,
                     "entry_pnl_at_first_exit": 0.0,
                     "order_id": order_result["order_id"] if order_result else None,
                     "stop_order_id": order_result["stop_order_id"] if order_result else None,
@@ -376,22 +370,14 @@ def main():
                 )
                 send_entry_signal(entry_sig)
                 log_signal({
-                    "timestamp": now_et.isoformat(),
-                    "ticker": ticker,
-                    "action": "ENTRY",
-                    "price": entry_sig.price,
-                    "stop": entry_sig.stop,
-                    "target_2r": entry_sig.target_2r,
-                    "risk_per_share": entry_sig.risk_per_share,
-                    "reason": entry_sig.reason,
-                    "score": entry_sig.score,
-                    "gap_pct": entry_sig.gap_pct,
-                    "rel_vol": entry_sig.rel_vol,
-                    "total_vol": entry_sig.total_vol,
-                    "shares": shares_total,
-                    "partial": False,
-                    "daily_pnl": daily_pnl,
-                    "peak_daily_pnl": peak_daily_pnl,
+                    "timestamp": now_et.isoformat(), "ticker": ticker,
+                    "action": "ENTRY", "price": entry_sig.price,
+                    "stop": entry_sig.stop, "target_2r": entry_sig.target_2r,
+                    "risk_per_share": entry_sig.risk_per_share, "reason": entry_sig.reason,
+                    "score": entry_sig.score, "gap_pct": entry_sig.gap_pct,
+                    "rel_vol": entry_sig.rel_vol, "total_vol": entry_sig.total_vol,
+                    "shares": shares_total, "partial": False,
+                    "daily_pnl": daily_pnl, "peak_daily_pnl": peak_daily_pnl,
                 })
             else:
                 print(f" {now_et.strftime('%H:%M')} {ticker} no signal", flush=True)
