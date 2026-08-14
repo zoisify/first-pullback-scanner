@@ -60,13 +60,19 @@ MAX_ENTRIES_PER_TICKER = 2  # initial + 1 re-entry after stop
 def load_candidates() -> list[dict]:
     date_str = datetime.now(ET).strftime("%Y%m%d")
     path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
+
     if not os.path.exists(path):
         print(f" No candidates file found at {path}")
         print(" Run main_scan.py first.")
         return []
-    with open(path) as f:
-        return json.load(f)
 
+    with open(path, encoding="utf-8") as file:
+        payload = json.load(file)
+
+    if isinstance(payload, dict):
+        payload = payload.get("candidates", [])
+
+    return payload if isinstance(payload, list) else []
 
 def load_watchlist() -> list[str]:
     path = "data/watchlist.csv"
