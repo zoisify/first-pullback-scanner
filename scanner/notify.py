@@ -31,10 +31,6 @@ def _post(payload: dict) -> bool:
 
 
 def send_scan_summary(candidates: list[dict]) -> bool:
-    """
-    Send a pre-market scan summary to Discord.
-    Called by main_scan.py after scoring all tickers.
-    """
     now = datetime.now(ET).strftime("%I:%M %p ET")
 
     if not candidates:
@@ -48,7 +44,7 @@ def send_scan_summary(candidates: list[dict]) -> bool:
         return _post(payload)
 
     fields = []
-    for c in candidates[:8]:   # Discord limit: 25 fields per embed
+    for c in candidates[:8]:
         pillar_str = "  ".join(f"{k}:{v}" for k, v in c["pillars"].items())
         fields.append({
             "name": f"**{c['ticker']}**  ${c['price']}  |  {c['score']}/5 pillars",
@@ -77,10 +73,6 @@ def send_scan_summary(candidates: list[dict]) -> bool:
 
 
 def send_entry_signal(signal) -> bool:
-    """
-    Send an entry signal notification.
-    Includes entry price, stop, 2R target, and risk per share.
-    """
     now = datetime.now(ET).strftime("%I:%M %p ET")
     pillar_str = "  ".join(f"{k}:{v}" for k, v in signal.pillars.items())
 
@@ -96,11 +88,11 @@ def send_entry_signal(signal) -> bool:
             ),
             "color": 0x00FF00,
             "fields": [
-                {"name": "Entry",         "value": f"**${signal.price}**", "inline": True},
-                {"name": "Stop Loss",     "value": f"**${signal.stop}**",  "inline": True},
-                {"name": "Target (2R)",   "value": f"**${signal.target_2r}**", "inline": True},
-                {"name": "Risk/share",    "value": f"${signal.risk_per_share}", "inline": True},
-                {"name": "Pillar score",  "value": f"{signal.score}/5",    "inline": True},
+                {"name": "Entry",       "value": f"**${signal.price}**",    "inline": True},
+                {"name": "Stop Loss",   "value": f"**${signal.stop}**",     "inline": True},
+                {"name": "Target (2R)", "value": f"**${signal.target_2r}**","inline": True},
+                {"name": "Risk/share",  "value": f"${signal.risk_per_share}","inline": True},
+                {"name": "Pillar score","value": f"{signal.score}/5",       "inline": True},
                 {
                     "name": "Position size guide",
                     "value": (
@@ -118,18 +110,17 @@ def send_entry_signal(signal) -> bool:
 
 
 def send_exit_signal(signal, entry_price: float, pnl_per_share: float) -> bool:
-    """Send an exit signal with reason and P&L per share."""
     now = datetime.now(ET).strftime("%I:%M %p ET")
     color = 0xFF0000 if pnl_per_share < 0 else 0xFFA500
 
     reason_labels = {
-        "stop_loss":       "🛑 Stop loss hit",
-        "vol_spike_seller":"⚠️ Volume spike (big seller proxy)",
-        "topping_tail":    "⚠️ Topping tail candle",
-        "below_ema9":      "⚠️ Price below 9 EMA",
-        "below_vwap":      "⚠️ Price below VWAP",
-        "hard_cutoff":     "⏰ 10:00 AM hard cutoff",
-        "2r_target":       "✅ 2R target reached — scale out",
+        "stop_loss":             "🛑 Stop loss hit",
+        "vol_spike_seller":      "⚠️ Volume spike (big seller proxy)",
+        "topping_tail":          "⚠️ Topping tail candle",
+        "below_ema9":            "⚠️ Price below 9 EMA",
+        "below_vwap":            "⚠️ Price below VWAP",
+        "hard_cutoff":           "⏰ 10:00 AM hard cutoff",
+        "2r_target":             "✅ 2R target reached — scale out",
     }
     reason_label = reason_labels.get(signal.reason, signal.reason)
 
@@ -139,9 +130,9 @@ def send_exit_signal(signal, entry_price: float, pnl_per_share: float) -> bool:
             "description": reason_label,
             "color": color,
             "fields": [
-                {"name": "Entry",       "value": f"${entry_price}", "inline": True},
-                {"name": "Exit",        "value": f"${signal.price}", "inline": True},
-                {"name": "P&L/share",   "value": f"${pnl_per_share:+.2f}", "inline": True},
+                {"name": "Entry",     "value": f"${entry_price}",          "inline": True},
+                {"name": "Exit",      "value": f"${signal.price}",          "inline": True},
+                {"name": "P&L/share", "value": f"${pnl_per_share:+.2f}",   "inline": True},
             ],
         }]
     }
@@ -149,7 +140,6 @@ def send_exit_signal(signal, entry_price: float, pnl_per_share: float) -> bool:
 
 
 def send_no_candidates(reason: str = "") -> bool:
-    """Send a 'no trade today' message so you know the scanner ran."""
     now = datetime.now(ET).strftime("%I:%M %p ET")
     payload = {
         "embeds": [{
@@ -162,7 +152,6 @@ def send_no_candidates(reason: str = "") -> bool:
 
 
 def send_daily_cutoff(total_signals: int) -> bool:
-    """Send the 10:00 AM hard cutoff message."""
     payload = {
         "embeds": [{
             "title": "⏰ 10:00 AM — Hard cutoff reached",
@@ -171,6 +160,31 @@ def send_daily_cutoff(total_signals: int) -> bool:
                 f"Total entry signals this session: **{total_signals}**"
             ),
             "color": 0x808080,
+        }]
+    }
+    return _post(payload)
+
+
+def send_pnl_update(
+    daily_pnl: float,
+    peak_daily_pnl: float,
+    total_signals: int,
+    final: bool = False,
+) -> bool:
+    """Send a 30-minute P&L update to Discord."""
+    now = datetime.now(ET).strftime("%I:%M %p ET")
+    color = 0x00FF00 if daily_pnl >= 0 else 0xFF0000
+    title = f"{'✅ Final' if final else '📊 P&L Update'} — {now}"
+
+    payload = {
+        "embeds": [{
+            "title": title,
+            "color": color,
+            "fields": [
+                {"name": "Daily P&L",      "value": f"**${daily_pnl:+,.2f}**",      "inline": True},
+                {"name": "Peak P&L",       "value": f"${peak_daily_pnl:+,.2f}",      "inline": True},
+                {"name": "Total signals",  "value": str(total_signals),               "inline": True},
+            ],
         }]
     }
     return _post(payload)
