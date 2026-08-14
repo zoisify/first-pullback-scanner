@@ -3,16 +3,18 @@ scanner/pillars.py
 
 The 5-pillar universe filter from the transcript, scored per ticker.
 Uses alpaca-py (new SDK) for real-time bars and quote data.
+Float lookup via Financial Modeling Prep (FMP) free API.
 
-Ross's pillars (from transcript):
-1. Relative volume >= 5x (he mentions 5-10x sweet spot, >20x exceptional)
-2. Gap / move >= 10% from prior close
+Ross's pillars:
+1. Relative volume >= 5x
+2. Gap >= 10% from prior close
 3. Price between $2 and $20
 4. Float <= 20 million shares
-5. Total volume >= 100K (lowered from 500K - early pre-market vol is low)
+5. Total volume >= 100K
 """
 
 import os
+import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,7 +23,6 @@ ET = ZoneInfo("America/New_York")
 
 
 def get_alpaca_client():
-    """Returns an Alpaca REST client using env vars set by GitHub Actions secrets."""
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.trading.client import TradingClient
 
@@ -35,12 +36,6 @@ def get_alpaca_client():
 
 
 def get_bars(api, ticker: str, limit: int = 60) -> pd.DataFrame:
-    """
-    Fetch the last `limit` 1-minute bars for a ticker.
-    api should be the data_client (StockHistoricalDataClient).
-    Returns a DataFrame with columns Open/High/Low/Close/Volume.
-    Returns empty DataFrame on failure.
-    """
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
@@ -86,6 +81,49 @@ def get_asset_info(api, ticker: str) -> dict:
         return {}
 
 
+def get_float_fmp(ticker: str) -> int | None:
+    """
+    Get float shares from Financial Modeling Prep free API.
+    Called only on the single #1 gapper so no rate limit issues.
+    Returns float share count or None on failure.
+    """
+    try:
+        api_key = os.environ.get("FMP_API_KEY", "")
+        if not api_key:
+            print(f" [FMP] No FMP_API_KEY set - skipping float lookup")
+            return None
+
+        url = f"https://financialmodelingprep.com/stable/shares-float?symbol={ticker}&apikey={api_key}"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if isinstance(data, list) and len(data) > 0:
+            float_shares = data[0].get("floatShares")
+            if float_shares:
+                print(f" [FMP] {ticker} float: {int(float_shares):,}")
+                return int(float_shares)
+
+        # Fallback: profile endpoint
+        url2 = f"https://financialmodelingprep.com/stable/profile?symbol={ticker}&apikey={api_key}"
+        r2 = requests.get(url2, timeout=10)
+        r2.raise_for_status()
+        data2 = r2.json()
+
+        if isinstance(data2, list) and len(data2) > 0:
+            shares = data2[0].get("floatShares") or data2[0].get("sharesOutstanding")
+            if shares:
+                print(f" [FMP] {ticker} shares (profile): {int(shares):,}")
+                return int(shares)
+
+        print(f" [FMP] No float data found for {ticker}")
+        return None
+
+    except Exception as e:
+        print(f" [FMP] Float lookup failed for {ticker}: {e}")
+        return None
+
+
 def score_ticker(
     api,
     ticker: str,
@@ -94,13 +132,9 @@ def score_ticker(
     min_gap_pct: float = 0.10,
     min_rel_vol: float = 5.0,
     max_float: int = 20_000_000,
-    min_total_vol: int = 100_000,  # lowered from 500K - rel vol does the heavy lifting
+    min_total_vol: int = 100_000,
+    use_fmp_float: bool = False,
 ) -> dict | None:
-    """
-    Score a single ticker against the 5 pillars.
-    api is a tuple: (data_client, trading_client)
-    Returns a result dict if it passes >= 4 pillars, else None.
-    """
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
@@ -154,10 +188,13 @@ def score_ticker(
     expected_vol = avg_daily_vol * (elapsed_min / 390)
     rel_vol = total_vol / expected_vol if expected_vol > 0 else 0
 
-    # Float via yfinance
-    float_shares = _get_float_yfinance(ticker)
+    # Float - only call FMP for the final #1 stock
+    if use_fmp_float:
+        float_shares = get_float_fmp(ticker)
+    else:
+        float_shares = None
 
-    # --- Score each pillar ---
+    # Score pillars
     pillar_results = {
         "gap": gap_pct >= min_gap_pct,
         "price": min_price <= last_price <= max_price,
@@ -189,19 +226,6 @@ def score_ticker(
         "bars": bars,
         "prior_close": prior_close,
     }
-
-
-def _get_float_yfinance(ticker: str) -> int | None:
-    """
-    Try to get float shares from yfinance.
-    Uses floatShares (actual float) not sharesOutstanding.
-    """
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        return info.get("floatShares") or info.get("sharesOutstanding")
-    except Exception:
-        return None
 
 
 # legacy alias
