@@ -1,4 +1,4 @@
-"""Pre-market scan using current-day session boundaries."""
+"""Pre-market scan using only current pre-market bars and explicit regular close."""
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -32,14 +32,11 @@ def save_scan_log(candidates, all_results):
     os.makedirs(LOG_DIR, exist_ok=True)
     date_str = datetime.now(ET).strftime("%Y%m%d")
     path = os.path.join(LOG_DIR, f"scan_{date_str}.csv")
-    fields = ["ticker", "score", "price", "gap_pct", "rel_vol", "total_vol", "float", "gap", "price_pillar", "rel_vol_pillar", "volume_pillar", "float_pillar", "latest_trade_at", "premarket_start", "reference_session"]
+    fields = ["ticker", "score", "price", "gap_pct", "rel_vol", "total_vol", "float", "gap", "price_pillar", "rel_vol_pillar", "volume_pillar", "float_pillar", "latest_trade_at", "premarket_start", "premarket_end", "reference_close_at", "reference_session"]
     with open(path, "w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
+        writer = csv.DictWriter(file, fieldnames=fields); writer.writeheader()
         for item in all_results:
-            writer.writerow({
-                "ticker": item.get("ticker", ""), "score": item.get("score", 0), "price": item.get("price", ""), "gap_pct": item.get("gap_pct", ""), "rel_vol": item.get("rel_vol", ""), "total_vol": item.get("total_vol", ""), "float": item.get("float", ""), "gap": item.get("pillars", {}).get("gap", ""), "price_pillar": item.get("pillars", {}).get("price", ""), "rel_vol_pillar": item.get("pillars", {}).get("rel_vol", ""), "volume_pillar": item.get("pillars", {}).get("volume", ""), "float_pillar": item.get("pillars", {}).get("float", ""), "latest_trade_at": item.get("session", {}).get("latest_trade_at", ""), "premarket_start": item.get("session", {}).get("premarket_start", ""), "reference_session": item.get("session", {}).get("reference_session", ""),
-            })
+            writer.writerow({"ticker": item.get("ticker", ""), "score": item.get("score", 0), "price": item.get("price", ""), "gap_pct": item.get("gap_pct", ""), "rel_vol": item.get("rel_vol", ""), "total_vol": item.get("total_vol", ""), "float": item.get("float", ""), "gap": item.get("pillars", {}).get("gap", ""), "price_pillar": item.get("pillars", {}).get("price", ""), "rel_vol_pillar": item.get("pillars", {}).get("rel_vol", ""), "volume_pillar": item.get("pillars", {}).get("volume", ""), "float_pillar": item.get("pillars", {}).get("float", ""), **item.get("session", {})})
     json_path = os.path.join(LOG_DIR, f"candidates_{date_str}.json")
     with open(json_path, "w") as file: json.dump([_clean(item) for item in candidates], file, indent=2, cls=_Encoder)
     print(f" Scan log: {path}\n Candidates: {json_path}")
@@ -53,24 +50,21 @@ def write_watchlist_csv(candidates):
 
 def main():
     print(f"\n{'=' * 55}\n Pre-Market Auto-Scan - #1 Gapper Focus\n {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')}\n{'=' * 55}\n")
-    raw_hits = screen_market(min_price=2.0, max_price=20.0, min_gap_pct=0.10, min_volume=100_000, max_results=25)
+    raw_hits = screen_market(min_price=2, max_price=20, min_gap_pct=0.10, min_volume=100000, max_results=25)
     if not raw_hits:
-        send_all_pillar_report([]); send_no_candidates("No stocks found gapping up >=10% today. Sit on hands."); return
+        send_all_pillar_report([]); send_no_candidates("No current-day pre-market stocks found. Sit on hands."); return
     api = _get_alpaca_client(); results = []
     for hit in raw_hits:
-        ticker = hit["ticker"]
-        print(f" {ticker} ...", end=" ", flush=True)
+        ticker = hit["ticker"]; print(f" {ticker} ...", end=" ", flush=True)
         float_shares = get_float(ticker)
-        result = evaluate_ticker(api, ticker, raw_hit=hit, float_shares=float_shares)
-        results.append(result)
+        result = evaluate_ticker(api, ticker, raw_hit=hit, float_shares=float_shares); results.append(result)
         print(f"{result['score']}/5 gap={result.get('gap_pct')}% rvol={result.get('rel_vol')}x vol={result.get('total_vol')} float={result.get('float')}")
-    results.sort(key=lambda item: (item.get("score", 0), item.get("gap_pct") or 0), reverse=True)
-    send_all_pillar_report(results)
+    results.sort(key=lambda item: (item.get("score", 0), item.get("gap_pct") or 0), reverse=True); send_all_pillar_report(results)
     passing = [item for item in results if item.get("score", 0) >= 4 or (item.get("score", 0) == 3 and "UNKNOWN" in item.get("pillars", {}).values())]
-    top_candidate = passing[:1]
-    if not top_candidate:
-        save_scan_log([], results); write_watchlist_csv([]); send_no_candidates(f"Found {len(raw_hits)} gapping stocks. Full five-pillar diagnostics sent, but none passed >=4/5 pillars. No trades today."); print("\n Done."); return
-    save_scan_log(top_candidate, results); write_watchlist_csv(top_candidate); send_scan_summary(top_candidate)
-    print(f"\n #1 Gapper: {top_candidate[0]['ticker']} - {top_candidate[0].get('gap_pct')}% gap, {top_candidate[0]['score']}/5 pillars\n\n Done.")
+    top = passing[:1]
+    if not top:
+        save_scan_log([], results); write_watchlist_csv([]); send_no_candidates(f"Found {len(raw_hits)} current-day pre-market gapper(s), but none passed the existing provisional threshold."); return
+    save_scan_log(top, results); write_watchlist_csv(top); send_scan_summary(top)
+    print(f"\n #1 Gapper: {top[0]['ticker']} - {top[0].get('gap_pct')}% current-day pre-market gap, {top[0]['score']}/5 pillars\n\n Done.")
 
 if __name__ == "__main__": main()
