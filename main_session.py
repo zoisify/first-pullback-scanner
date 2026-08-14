@@ -44,7 +44,7 @@ CUTOFF_H = 10
 
 RISK_PCT = 0.01          # 1% risk on initial entry
 SCALEIN_RISK_PCT = 0.005 # 0.5% risk on scale-in
-ACCOUNT_EQUITY = 65_000.0
+ACCOUNT_EQUITY = 100_000.0
 MAX_DAILY_LOSS = 2_000.0
 FIRST_EXIT_SELL_FRAC = 0.6
 PNL_UPDATE_INTERVAL = 30  # minutes
