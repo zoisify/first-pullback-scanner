@@ -2,26 +2,53 @@
 
 Automated implementation of the Ross Cameron "first pullback" momentum
 day-trading scanner. Runs entirely free on GitHub Actions every trading
-morning. No server required.
+morning. No server required. Trades exclusively via Alpaca **paper trading**
+— no real money is ever at risk.
 
 ## What it does
 
 | Time (ET) | What happens |
 |---|---|
-| 7:00 AM | Pre-market scan fires — scores all tickers against 5 pillars |
-| 7:00–10:00 AM | Session monitor polls every minute for entry signals |
-| On signal | Discord notification with ticker, price, stop, target, pillar scores |
-| 10:00 AM | Hard cutoff — no new signals sent |
-| Market close | Daily log saved as GitHub Actions artifact |
+| 7:05 AM | Single workflow fires: pre-market scan runs first |
+| 7:05 AM | `main_scan.py` scans the **entire US equity market**, filters to the single **#1 gapper**, scores it against 5 pillars |
+| Immediately after | `main_session.py` starts polling that one ticker every 60 seconds for a first-pullback entry |
+| On entry | Discord alert with entry price, stop, 2R target, pillar score, position-size guide |
+| On scale-in / partial exit / full exit | Discord alert with reason (stop hit, vol spike, topping tail, EMA/VWAP break, etc.) |
+| Every 30 min | Discord P&L update (running daily P&L + peak P&L + signal count) |
+| 10:00 AM | Hard cutoff — any open position is force-closed, no new entries fire |
+| Run end | Session/scan logs uploaded as a GitHub Actions artifact (30-day retention) |
+
+**Note:** this is a single-ticker system. It does not manage a multi-stock
+watchlist during the live session — it commits to whichever stock wins the
+pre-market scan and trades only that one.
+
+## Strategy at a glance
+
+- **Universe filter (5 pillars, need ≥4/5):** gap ≥10%, price $2–$20,
+  relative volume ≥5x, today's volume ≥100K, float ≤20M shares.
+- **Entry:** squeeze off a swing low (≥5%) → pullback retraces ≤50% of that
+  move while closing above 9-EMA/VWAP → a "crossing candle" (breaks prior
+  candle's high, closes green) triggers the buy. Stop = pullback low.
+- **Sizing:** risk 1% of a $100,000 paper account on entry, 0.5% on a
+  one-time scale-in when price makes a fresh high with another crossing
+  candle.
+- **Exit:** sell 60% on the first exit trigger (stop, volume-spike red
+  candle, topping tail, close below 9-EMA/VWAP), hold 40% as a trailing-stop
+  runner.
+- **Risk breakers:** stop taking new entries if daily P&L gives back 50% of
+  its peak, or hits a $2,000 max daily loss. Everything closes by 10:00 AM ET
+  regardless.
+- **Order safety:** every entry/scale-in checks the live bid/ask spread
+  (rejects if >2%) before submitting.
 
 ## Free tools used
 
 | Tool | What for | Cost |
 |---|---|---|
-| GitHub Actions | Scheduling + running the code | Free (public repo) |
-| Alpaca Markets | Real-time + historical bar data | Free (paper account) |
+| GitHub Actions | Scheduling + running the code (single `trading.yml` workflow) | Free (public repo) |
+| Alpaca Markets | Real-time/historical bar data, market-wide asset list, paper order execution | Free (paper account) |
 | Discord Webhook | Instant notifications on your phone | Free |
-| yfinance | Float/info fallback | Free |
+| yfinance | Float lookup (`floatShares`, falls back to `sharesOutstanding`) | Free |
 
 ---
 
@@ -40,8 +67,9 @@ Go to: https://github.com/new → paste this code in.
 4. Copy the **Key** and **Secret** — you only see the secret once
 
 Alpaca free tier gives you:
-- Real-time US stock data (IEX feed — covers ~80% of stocks)
+- Real-time US stock data (IEX feed)
 - Full historical minute bars
+- The full tradable asset list (used for the full-market pre-market scan)
 - Paper order execution
 - No credit card needed
 
@@ -56,7 +84,7 @@ Alpaca free tier gives you:
 
 In your GitHub repo: **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
 
-Add these three secrets:
+Add these three secrets (both jobs in the single workflow share them):
 
 | Secret name | Value |
 |---|---|
@@ -66,36 +94,59 @@ Add these three secrets:
 
 ### Step 5 — Enable Actions
 
-Go to your repo → **Actions** tab → click **"I understand my workflows, enable them"**
-
-That's it. The workflow runs automatically every weekday morning.
+Go to your repo → **Actions** tab → click **"I understand my workflows, enable them"**.
+The single `trading.yml` workflow runs automatically every weekday at 7:05 AM ET
+(cron: `5 11 * * 1-5`) and can also be triggered manually via `workflow_dispatch`.
 
 ---
 
-## Expanding the watchlist
+## Manual override watchlist
 
-Edit `data/watchlist.csv` and add tickers — one per line.
-Build it up by saving every Finviz gap-scan result each morning:
-https://finviz.com/screener.ashx?v=111&f=sh_price_u20,sh_price_o2,ta_gap_u10&o=-gap
+`data/watchlist.csv` is normally **auto-written** by `main_scan.py` after the
+market-wide scan (it will contain just the #1 gapper). If the daily
+candidates file is missing when the session monitor starts, it falls back to
+reading whatever tickers are in this file and scores them live — so you can
+drop tickers in here manually as a backup, but it's not required day-to-day
+like it used to be.
 
-The more tickers in the watchlist, the better the scanner gets over time.
+## Known issues / things still worth fixing
 
-## Files
+- `main_scan.py` imports `python-dotenv` (`from dotenv import load_dotenv`)
+  but `python-dotenv` is **not listed in `requirements.txt`** — will fail
+  on a clean install unless run where it's already present.
+- `notify.py`'s position-size guide example uses **£** while
+  `main_session.py`'s `ACCOUNT_EQUITY` is in **$** — cosmetic but inconsistent.
+- `.env` and files under `logs/` have been accidentally committed at least
+  once despite being listed in `.gitignore` — worth double-checking history
+  if the repo is ever made public, in case a real key leaked.
+- Single-workflow design means a slow pre-market scan step delays the start
+  of the session monitor within the same 180-minute job window.
+
+## Files (current)
 
 ```
 .github/workflows/
-  premarket_scan.yml     — runs at 7:00 AM ET, scores all tickers
-  session_monitor.yml    — runs 7:00–10:00 AM ET, fires entry signals
+  trading.yml             — single workflow: installs deps, runs main_scan.py
+                             then main_session.py, uploads logs/ as an artifact
 
 scanner/
-  pillars.py             — 5 pillar universe filter
-  signals.py             — first pullback entry/exit signal logic
-  notify.py              — Discord notification formatter
+  __init__.py
+  auto_screener.py        — scans the full US equity market (no static watchlist)
+  pillars.py               — 5-pillar scoring + Alpaca client helpers
+  signals.py               — first pullback entry/exit/scale-in/trailing-stop logic
+  executor.py               — Alpaca order submission (entry/scale-in/exit/trailing stop)
+  notify.py                 — Discord notification formatter (scan/entry/exit/P&L)
 
 data/
-  watchlist.csv          — tickers to scan (edit this to expand)
+  watchlist.csv            — auto-written daily; manual fallback list
 
-main_scan.py             — pre-market scan entrypoint
-main_session.py          — session monitor entrypoint
+logs/
+  scan_YYYYMMDD.csv         — all scored candidates for the day
+  candidates_YYYYMMDD.json  — the #1 gapper's full data (incl. bars)
+  session_YYYYMMDD.csv      — every entry/scale-in/exit event
+
+main_scan.py               — pre-market scan entrypoint
+main_session.py            — session monitor entrypoint (7:05–10:00 AM ET)
+test_order.py              — standalone script to test a buy/sell round-trip
 requirements.txt
 ```
